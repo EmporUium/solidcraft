@@ -2,7 +2,7 @@
 //! interpolation of each reference curve's position and derivatives at the joints. This is the
 //! geometry `sketch.blend_curve` builds; it knows nothing about sketches or the document.
 
-use crate::{MAX_DERIVATIVE_ORDER, Vec2, profile::binom};
+use crate::{MAX_DERIVATIVE_ORDER, Vec2, Vec3, profile::binom};
 
 /// Control points of the Bézier of degree `2k + 1`, `k = d0.len()`, that starts at `p0` with
 /// derivatives `d0` and ends at `p1` with derivatives `d1`, all with respect to its own parameter
@@ -47,6 +47,45 @@ pub fn hermite_bezier(p0: Vec2, p1: Vec2, d0: &[Vec2], d1: &[Vec2]) -> Option<Ve
     c.iter().all(|p| p.is_finite()).then_some(c)
 }
 
+/// [`hermite_bezier`] in space: the same construction, componentwise, for a blend that leaves the
+/// sketch plane. Control points of the degree `2k + 1` Bézier joining `p0` to `p1` with the given
+/// derivatives at each end.
+pub fn hermite_bezier3(p0: Vec3, p1: Vec3, d0: &[Vec3], d1: &[Vec3]) -> Option<Vec<Vec3>> {
+    let k = d0.len();
+    if k != d1.len() || k > MAX_DERIVATIVE_ORDER || !p0.is_finite() || !p1.is_finite() || d0.iter().chain(d1).any(|d| !d.is_finite()) {
+        return None;
+    }
+    let n = 2 * k + 1;
+    let mut c = vec![Vec3::ZERO; n + 1];
+    c[0] = p0;
+    for j in 1..=k {
+        let scale = 1.0 / (0..j).fold(1.0, |acc, i| acc * (n - i) as f64);
+        let mut value = d0[j - 1] * scale;
+        for (i, p) in c.iter().take(j).enumerate() {
+            value += *p * (odd_sign(j - i) * binom(j, i));
+        }
+        c[j] = value;
+    }
+    c[n] = p1;
+    for j in 1..=k {
+        let scale = 1.0 / (0..j).fold(1.0, |acc, i| acc * (n - i) as f64);
+        let mut value = d1[j - 1] * (scale * odd_sign(j + 1));
+        for (i, p) in c[n - j + 1..].iter().rev().enumerate() {
+            value += *p * (odd_sign(j + i) * binom(j, i));
+        }
+        c[n - j] = value;
+    }
+    c.iter().all(|p| p.is_finite()).then_some(c)
+}
+
+/// A point on the Bézier with the given control points, by de Casteljau.
+pub fn bezier_point3(c: &[Vec3], t: f64) -> Vec3 {
+    let mut work = c.to_vec();
+    while work.len() > 1 {
+        work = work.windows(2).map(|w| w[0] * (1.0 - t) + w[1] * t).collect();
+    }
+    work.first().copied().unwrap_or(Vec3::ZERO)
+}
 /// `(−1)^(m + 1)`: the sign an m-th difference expansion carries in a Bézier's endpoint identity.
 fn odd_sign(m: usize) -> f64 {
     if m % 2 == 1 { 1.0 } else { -1.0 }

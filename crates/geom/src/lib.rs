@@ -36,7 +36,7 @@ mod vec;
 
 pub use aabb2::Aabb2;
 pub use arcfit::MAX_FIT_PIECES;
-pub use blend::hermite_bezier;
+pub use blend::{bezier_point3, hermite_bezier, hermite_bezier3};
 pub use bvh::{Bvh, MeshIndex};
 pub use chain::{Chain, Closed, Ends, Open, Path, Planar, Ring};
 pub use grid::Grid;
