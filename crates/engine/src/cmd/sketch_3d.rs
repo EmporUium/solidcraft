@@ -25,7 +25,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("sketch.blend3d", "3D Blend Curve", blend3d)
         .at("SKETCH", "3D")
         .icon("blend")
-        .enabled(in_sketch_3d)
+        .enabled(can_blend3d)
         .params(concat!(
             "a, b: curve end points as `w1.start` or `w1.end`, continuity?: g0 | g1 (default g1), a_tension?, b_tension?: handle length at each joint as a multiple of a third of the span (default 1, 0.01 to 100): one 3D curve joined to both, tangent to each at the joint when g1 (needs 3D Sketch on)",
             created_doc!()
@@ -69,6 +69,31 @@ fn in_sketch_3d(s: &Session) -> std::result::Result<(), String> {
         Ok(sk) if sk.view.three_d => Ok(()),
         Ok(_) => Err("turn on 3D Sketch (sketch.options sketch_3d: true) to draw 3D arcs".into()),
         Err(_) => Err("no sketch is being edited (Create Sketch or Edit Sketch first)".into()),
+    }
+}
+
+/// Blending is offered while a 3D sketch is edited, and also when an existing blend is selected:
+/// that selection is the edit, so its sketch need not be open.
+fn can_blend3d(s: &Session) -> std::result::Result<(), String> {
+    if in_sketch_3d(s).is_ok() {
+        return Ok(());
+    }
+    let state = s.model.state();
+    let picked = s.selection.iter().any(|sel| {
+        let crate::Sel::SketchCurve { id, sketch } = sel else { return false };
+        state
+            .sketches
+            .iter()
+            .filter(|ss| sketch.is_none_or(|k| ss.feature == k))
+            .any(|ss| ss.sketch.wires.iter().any(|w| &w.id == id && (w.blend.is_some() || w.bezier.is_some())))
+    });
+    if picked {
+        Ok(())
+    } else {
+        Err(match in_sketch_3d(s) {
+            Err(e) => format!("{e}, or select a blend curve to edit it"),
+            Ok(()) => "select a blend curve to edit it".into(),
+        })
     }
 }
 

@@ -134,7 +134,7 @@ pub enum Mod {
     /// `sketch.blend3d`: two joints joined by one curve. Each joint is a point or vertex, the
     /// edge whose direction it leaves or enters, and the tension on that handle. Six values in
     /// all, picked left to right in that order.
-    Blend { a_tension: String, b_tension: String, editing: Option<String> },
+    Blend { a_tension: String, b_tension: String, editing: Option<String>, target: Option<u64> },
 }
 
 impl Mod {
@@ -247,18 +247,25 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
             copy: false,
         },
         "sketch.blend3d" => {
-            // A selected blend curve opens for editing: its inputs are already recorded.
-            let editing = app.session.active_sketch.and_then(|s| app.session.doc.sketch(s).ok()).and_then(|sk| {
-                app.session.selection.iter().find_map(|sel| match sel {
-                    Sel::SketchCurve { id, .. } => sk.wires.iter().find(|w| &w.id == id && w.bezier.is_some()).map(|w| (id.clone(), w.blend.clone())),
-                    _ => None,
-                })
+            // A selected blend curve opens for editing, whether or not its sketch is the one being
+            // edited: the curve itself says which sketch it belongs to.
+            let state = app.session.world_state();
+            let editing = app.session.selection.iter().find_map(|sel| match sel {
+                Sel::SketchCurve { id, sketch } => state.sketches.iter().filter(|ss| sketch.is_none_or(|k| ss.feature == k)).find_map(|ss| {
+                    ss.sketch.wires.iter().find(|w| &w.id == id && w.bezier.is_some()).map(|w| (ss.feature, id.clone(), w.blend.clone()))
+                }),
+                _ => None,
             });
             match editing {
-                Some((id, Some(b))) => Mod::Blend { a_tension: format!("{}", b.a.tension), b_tension: format!("{}", b.b.tension), editing: Some(id) },
+                Some((sketch, id, Some(b))) => Mod::Blend {
+                    a_tension: format!("{}", b.a.tension),
+                    b_tension: format!("{}", b.b.tension),
+                    editing: Some(id),
+                    target: Some(sketch),
+                },
                 // A blend from before its inputs were recorded edits from its handles alone.
-                Some((id, None)) => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: Some(id) },
-                _ => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: None },
+                Some((sketch, id, None)) => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: Some(id), target: Some(sketch) },
+                None => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: None, target: None },
             }
         }
         "sketch.pattern.rectangular" => Mod::PatternRect {
@@ -471,7 +478,7 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Mod, doc: &Document) -> bool {
         Mod::Mirror => {}
         // The two tensions sit beside their tangents, drawn by the dialog's input loop; only the
         // edit window, which has no picks, shows them here.
-        Mod::Blend { editing: Some(_), a_tension, b_tension } => {
+        Mod::Blend { editing: Some(_), a_tension, b_tension, .. } => {
             enter |= number(ui, "Tension 1", a_tension);
             enter |= number(ui, "Tension 2", b_tension);
         }
@@ -828,12 +835,17 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             }
             ("sketch.offset", params)
         }
-        Mod::Blend { a_tension, b_tension, editing } => {
+        Mod::Blend { a_tension, b_tension, editing, target } => {
             // Editing reuses the recorded joints and tangents; only the tensions come from here.
             let ta = value(app, a_tension, ValueKind::Unitless, "Tension 1")?;
             let tb = value(app, b_tension, ValueKind::Unitless, "Tension 2")?;
             if let Some(id) = editing {
-                return Ok(vec![("sketch.blend3d".to_string(), json!({"edit": id, "a_tension": ta, "b_tension": tb}))]);
+                let mut params = json!({"edit": id, "a_tension": ta, "b_tension": tb});
+                // The blend may live in a sketch that is not the one being edited.
+                if let Some(sketch) = target {
+                    params["sketch"] = json!(sketch);
+                }
+                return Ok(vec![("sketch.blend3d".to_string(), params)]);
             }
             let picked =
                 |i: usize, what: &str| -> Result<Sel, String> { items(inputs, i).first().cloned().ok_or_else(|| format!("Select the {what}")) };
