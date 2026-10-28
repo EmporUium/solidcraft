@@ -920,6 +920,10 @@ fn ribbon_label(app: &SolveApp, label: &str) -> String {
         .tr_label(label)
         .split_whitespace()
         .map(|word| {
+            // Words carrying a digit keep their casing: "3D" must not become "3d".
+            if word.chars().any(|c| c.is_ascii_digit()) {
+                return word.to_string();
+            }
             let lower = word.to_lowercase();
             let mut chars = lower.chars();
             chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
