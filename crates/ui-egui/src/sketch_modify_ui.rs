@@ -33,7 +33,7 @@ use solidcraft_engine::sketch::PatternAlignment;
 
 use crate::SolveApp;
 use crate::dialogs::{CHAMFER_TYPES, Dialog, Kind};
-use crate::selection::{AXES, CURVES, SKETCH_POINTS, SelInput};
+use crate::selection::{AXES, CURVES, EDGES, SKETCH_POINTS, SelInput, VERTICES, point_value as pt};
 use crate::tool_modifiers::{Audit, Scope, ToolModifiers};
 use crate::ui_kit;
 use crate::viewport::{Hit, Proj};
@@ -131,6 +131,10 @@ pub enum Mod {
     /// `angle` the angle from the first line. `flip` names the two lines in the other order, so
     /// the first distance lands on the other leg of the corner.
     Corner { chamfer: bool, ctype: usize, size: String, distance2: String, angle: String, flip: bool },
+    /// `sketch.blend3d`: two joints joined by one curve. Each joint is a point or vertex, the
+    /// edge whose direction it leaves or enters, and the tension on that handle. Six values in
+    /// all, picked left to right in that order.
+    Blend { a_tension: String, b_tension: String },
 }
 
 impl Mod {
@@ -149,6 +153,7 @@ impl Mod {
             Mod::PatternCirc { .. } => "CIRCULAR PATTERN",
             Mod::Corner { chamfer: false, .. } => "FILLET",
             Mod::Corner { .. } => "CHAMFER",
+            Mod::Blend { .. } => "3D BLEND CURVE",
         }
     }
 
@@ -165,6 +170,8 @@ impl Mod {
             Mod::PatternCirc { angle, .. } => Some(("Angle", ValueKind::Angle, angle)),
             Mod::Corner { chamfer: false, size, .. } => Some(("Radius", ValueKind::Length, size)),
             Mod::Corner { size, .. } => Some(("Distance", ValueKind::Length, size)),
+            // Two tensions, both edited in the window rather than on the canvas.
+            Mod::Blend { .. } => None,
         }
     }
 }
@@ -191,6 +198,14 @@ fn inputs(k: &Mod) -> Vec<SelInput> {
         // where more lines meet at its point (#1824), for both.
         Mod::Corner { chamfer: false, .. } => vec![SelInput::new("Corners", SKETCH_POINTS | CURVES, true)],
         Mod::Corner { .. } => vec![SelInput::new("Corner", SKETCH_POINTS | CURVES, true)],
+        // Point, then the edge that sets its tangent, twice: a corner can have several edges, so
+        // the tangent is always named rather than guessed.
+        Mod::Blend { .. } => vec![
+            SelInput::new("Point or vertex 1", VERTICES | SKETCH_POINTS | CURVES, true),
+            SelInput::new("Tangent 1", EDGES | CURVES, true),
+            SelInput::new("Point or vertex 2", VERTICES | SKETCH_POINTS | CURVES, true),
+            SelInput::new("Tangent 2", EDGES | CURVES, true),
+        ],
     }
 }
 
@@ -227,6 +242,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
             angle: "0 deg".into(),
             copy: false,
         },
+        "sketch.blend3d" => Mod::Blend { a_tension: "1".into(), b_tension: "1".into() },
         "sketch.pattern.rectangular" => Mod::PatternRect {
             count: "3".into(),
             spacing: crate::dialogs::length_default(&app.session, "20"),
@@ -356,6 +372,7 @@ pub(crate) fn command(k: &Mod) -> &'static str {
         Mod::Corner { ctype: 1, .. } => "sketch.chamfer.two_distance",
         Mod::Corner { ctype: 2, .. } => "sketch.chamfer.distance_angle",
         Mod::Corner { .. } => "sketch.chamfer.equal_distance",
+        Mod::Blend { .. } => "sketch.blend3d",
     }
 }
 
@@ -429,6 +446,10 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Mod, doc: &Document) -> bool {
             });
         }
         Mod::Mirror => {}
+        Mod::Blend { a_tension, b_tension } => {
+            enter |= number(ui, "Tension 1", a_tension);
+            enter |= number(ui, "Tension 2", b_tension);
+        }
         Mod::Move { x, y, angle, copy } => {
             enter |= ui_kit::value_pair(ui, "Position", [x, y], ["X", "Y"], Some(["X Distance", "Y Distance"]));
             enter |= number(ui, "Angle", angle);
@@ -780,6 +801,39 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                 }
             }
             ("sketch.offset", params)
+        }
+        Mod::Blend { a_tension, b_tension } => {
+            let picked =
+                |i: usize, what: &str| -> Result<Sel, String> { items(inputs, i).first().cloned().ok_or_else(|| format!("Select the {what}")) };
+            let point_of = |i: usize, what: &str| -> Result<Value, String> {
+                match picked(i, what)? {
+                    Sel::Vertex { point, .. } | Sel::Edge { point, .. } => Ok(json!({"at": pt(point)})),
+                    // A sketch point is named, not given as coordinates: the engine knows the
+                    // sketch's frame, this window does not.
+                    Sel::SketchPoint { id, .. } => Ok(json!({"point": id})),
+                    _ => Err(format!("Pick a point or vertex for {what}")),
+                }
+            };
+            // The tangent names the exact edge: several meet at a corner, each a different
+            // tangency direction, so it is never inferred from the nearest one.
+            let tangent_of = |i: usize, what: &str| -> Result<Value, String> {
+                match picked(i, what)? {
+                    Sel::SketchCurve { id, .. } => Ok(json!(id)),
+                    Sel::Edge { body, index, .. } => Ok(json!({"body": body, "edge": index})),
+                    _ => Err(format!("Pick an edge or sketch curve for {what}")),
+                }
+            };
+            let ta = value(app, a_tension, ValueKind::Unitless, "Tension 1")?;
+            let tb = value(app, b_tension, ValueKind::Unitless, "Tension 2")?;
+            let params = json!({
+                "a_at": point_of(0, "Point or vertex 1")?,
+                "a_tangent": tangent_of(1, "Tangent 1")?,
+                "b_at": point_of(2, "Point or vertex 2")?,
+                "b_tangent": tangent_of(3, "Tangent 2")?,
+                "a_tension": ta,
+                "b_tension": tb,
+            });
+            ("sketch.blend3d", params)
         }
         Mod::Mirror => {
             let entities = entity_ids(&app.session, inputs, 0);
