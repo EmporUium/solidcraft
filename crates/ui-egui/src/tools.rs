@@ -149,7 +149,7 @@ pub fn hint(id: &str) -> String {
     match id {
         "sketch.line" => "Line: click points; right-click or Esc to finish".into(),
         "sketch.line3d" => "3D Line: click points in space; right-click or Esc to end the chain".into(),
-        "sketch.spline3d" => "3D Spline: click points in space; right-click or Esc finishes the curve and ends the tool".into(),
+        "sketch.spline3d" => "3D Spline: click points in space; right-click finishes the curve, as with the 2D spline".into(),
         "sketch.point3d" => "3D Point: click a point in space; right-click or Esc ends the tool".into(),
         "sketch.rectangle.two_point" => "Rectangle: click two opposite corners".into(),
         "sketch.rectangle.center" => "Center rectangle: click the centre, then a corner".into(),

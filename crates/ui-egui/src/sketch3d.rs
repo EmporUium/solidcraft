@@ -282,12 +282,8 @@ pub fn finish(app: &mut SolveApp) -> bool {
             app.run("sketch.spline3d", json!({ "points": q }))
         };
         report(app, r);
-        // A 3D spline is one curve: finishing it ends the tool, so one right-click is enough.
-        if cmd == "sketch.spline3d" {
-            set_chain(None, Vec::new());
-            app.tool = None;
-            return true;
-        }
+        // The 2D spline finishes on right-click and stays active for the next curve; the 3D one
+        // does the same so the two tools end the same way.
     }
     set_chain(Some(cmd), Vec::new());
     true
