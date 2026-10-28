@@ -62,6 +62,10 @@ pub struct Wire {
     /// are its three defining points (start, through, end) and whose `pts` are its samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arc: Option<WireArc>,
+    /// A blend curve drawn in a 3D sketch: its Bézier control polygon, which `pts` samples. The
+    /// controls are not fit points, so they are not drawn or picked as sketch points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bezier: Option<Vec<Vec3>>,
 }
 
 /// Most fit points of a drawn 3D curve.
@@ -113,6 +117,39 @@ pub fn fit_polyline(fit: &[Vec3]) -> Vec<Vec3> {
 
 /// Chord-height tolerance (mm) when sampling a drawn 3D arc into `pts`.
 const ARC_TOL: f64 = 1e-3;
+/// Display samples across a blend curve's Bézier.
+const BLEND_SAMPLES: usize = 48;
+
+/// Sample a Bézier control polygon, dropping coincident neighbours.
+///
+/// Args:
+///     control: Bézier control points, two or more.
+///
+/// Returns:
+///     The polyline through the curve, or an error when the controls are out of range or the
+///     whole curve collapses to a point.
+fn bezier_polyline(control: &[Vec3]) -> Result<Vec<Vec3>> {
+    if control.len() < 2 {
+        return Err(SketchError::Invalid("a blend curve needs at least two control points".into()));
+    }
+    for p in control {
+        if !in_range3(*p) {
+            return Err(SketchError::Invalid("3D point out of range".into()));
+        }
+    }
+    let n = BLEND_SAMPLES.max(control.len() * 8);
+    let mut pts: Vec<Vec3> = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let p = solidcraft_geom::bezier_point3(control, i as f64 / n as f64);
+        if pts.last().is_none_or(|q| (*q - p).len() > 1e-9) {
+            pts.push(p);
+        }
+    }
+    if pts.len() < 2 {
+        return Err(SketchError::Invalid("the points of a 3D curve must differ".into()));
+    }
+    Ok(pts)
+}
 
 /// The circular arc through `start`, `through` and `end` — the three points uniquely define
 /// it — running counter-clockwise about the plane normal from `start` through `through` to
@@ -308,7 +345,7 @@ impl Sketch {
                 Some(o) => o.clone(),
                 None => self.fresh("w")?,
             };
-            self.wires.push(Wire { id: wid, pts, space: WireSpace::Component, link: Some(id.to_string()), fit: Vec::new(), arc: None });
+            self.wires.push(Wire { id: wid, pts, space: WireSpace::Component, link: Some(id.to_string()), fit: Vec::new(), arc: None, bezier: None });
         }
         Ok(())
     }
@@ -323,7 +360,28 @@ impl Sketch {
         let pts = drawn_polyline(fit)?;
         self.wire_budget(None, 1, pts.len() + fit.len())?;
         let id = self.fresh(if fit.len() == 1 { "q" } else { "w" })?;
-        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: None });
+        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: None, bezier: None });
+        Ok(id)
+    }
+
+    /// Add a blend curve drawn in a 3D sketch: `control` is its Bézier control polygon in `space`.
+    ///
+    /// The controls belong to the curve (`bezier`), not to the sketch's draggable points, so a
+    /// blend shows only its two joints; `pts` are its samples.
+    ///
+    /// Args:
+    ///     control: Bézier control points, two or more, in `space`.
+    ///     space: The coordinate space the controls are given in.
+    ///
+    /// Returns:
+    ///     The new wire's id.
+    pub fn add_drawn_bezier_in(&mut self, control: &[Vec3], space: WireSpace) -> Result<String> {
+        let clean = bezier_polyline(control)?;
+        // Only the two joints are fit points: the handles stay inside the curve.
+        let fit = vec![control[0], control[control.len() - 1]];
+        self.wire_budget(None, 1, clean.len() + control.len())?;
+        let id = self.fresh("w")?;
+        self.wires.push(Wire { id: id.clone(), pts: clean, space, link: None, fit, arc: None, bezier: Some(control.to_vec()) });
         Ok(id)
     }
 
@@ -343,7 +401,7 @@ impl Sketch {
         let pts = arc_polyline(&arc, ARC_TOL);
         self.wire_budget(None, 1, pts.len() + fit.len())?;
         let id = self.fresh("w")?;
-        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: Some(arc) });
+        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: Some(arc), bezier: None });
         Ok(id)
     }
 
@@ -373,25 +431,36 @@ impl Sketch {
             }
             if changed {
                 // An exact arc keeps its analytic form: re-derive it from its three defining
-                // points; a spline keeps its fit-point polyline. Both before any change lands.
-                let (arc, pts) = match w.arc {
-                    Some(_) => {
+                // points. A blend keeps its control polygon, whose matching end moves with the
+                // joint, so its tangents survive the drag. Anything else is a fit-point spline.
+                let (arc, bezier, pts) = match (w.arc, w.bezier.clone()) {
+                    (Some(_), _) => {
                         let [start, through, end] = fit.as_slice() else {
                             return Err(SketchError::Invalid("a 3D arc needs exactly three points".into()));
                         };
                         let arc = arc_from_3_points(*start, *through, *end)
                             .ok_or_else(|| SketchError::Invalid("a 3D arc's points must differ and not be collinear".into()))?;
-                        (Some(arc), arc_polyline(&arc, ARC_TOL))
+                        (Some(arc), None, arc_polyline(&arc, ARC_TOL))
                     }
-                    None => (None, drawn_polyline(&fit)?),
+                    (None, Some(mut control)) => {
+                        for c in control.iter_mut() {
+                            if c.dist(from) < 1e-9 {
+                                *c = to;
+                            }
+                        }
+                        let pts = bezier_polyline(&control)?;
+                        (None, Some(control), pts)
+                    }
+                    (None, None) => (None, None, drawn_polyline(&fit)?),
                 };
-                changes.push((index, fit, arc, pts));
+                changes.push((index, fit, arc, bezier, pts));
             }
         }
-        for (index, fit, arc, pts) in changes {
+        for (index, fit, arc, bezier, pts) in changes {
             if let Some(w) = self.wires.get_mut(index) {
                 w.fit = fit;
                 w.arc = arc;
+                w.bezier = bezier;
                 w.pts = pts;
             }
         }
