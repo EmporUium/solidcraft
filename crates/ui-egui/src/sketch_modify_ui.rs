@@ -134,7 +134,7 @@ pub enum Mod {
     /// `sketch.blend3d`: two joints joined by one curve. Each joint is a point or vertex, the
     /// edge whose direction it leaves or enters, and the tension on that handle. Six values in
     /// all, picked left to right in that order.
-    Blend { a_tension: String, b_tension: String, editing: Option<String>, target: Option<u64> },
+    Blend { a_tension: String, b_tension: String, a_flip: bool, b_flip: bool, editing: Option<String>, target: Option<u64> },
 }
 
 impl Mod {
@@ -260,12 +260,16 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
                 Some((sketch, id, Some(b))) => Mod::Blend {
                     a_tension: format!("{}", b.a.tension),
                     b_tension: format!("{}", b.b.tension),
+                    a_flip: b.a.flip,
+                    b_flip: b.b.flip,
                     editing: Some(id),
                     target: Some(sketch),
                 },
                 // A blend from before its inputs were recorded edits from its handles alone.
-                Some((sketch, id, None)) => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: Some(id), target: Some(sketch) },
-                None => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: None, target: None },
+                Some((sketch, id, None)) => {
+                    Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), a_flip: false, b_flip: false, editing: Some(id), target: Some(sketch) }
+                }
+                None => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), a_flip: false, b_flip: false, editing: None, target: None },
             }
         }
         "sketch.pattern.rectangular" => Mod::PatternRect {
@@ -476,13 +480,15 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Mod, doc: &Document) -> bool {
             });
         }
         Mod::Mirror => {}
-        // The two tensions sit beside their tangents, drawn by the dialog's input loop; only the
-        // edit window, which has no picks, shows them here.
-        Mod::Blend { editing: Some(_), a_tension, b_tension, .. } => {
-            enter |= number(ui, "Tension 1", a_tension);
-            enter |= number(ui, "Tension 2", b_tension);
+        // The two tensions sit beside their tangents, drawn by the dialog's input loop; the
+        // direction each tangent runs in is a toggle at the end.
+        Mod::Blend { a_tension, b_tension, a_flip, b_flip, editing, .. } => {
+            if editing.is_some() {
+                enter |= number(ui, "Tension 1", a_tension);
+                enter |= number(ui, "Tension 2", b_tension);
+            }
+            ui_kit::checkbox_grid(ui, &mut [("Flip tangent 1", a_flip), ("Flip tangent 2", b_flip)], 2);
         }
-        Mod::Blend { .. } => {}
         Mod::Move { x, y, angle, copy } => {
             enter |= ui_kit::value_pair(ui, "Position", [x, y], ["X", "Y"], Some(["X Distance", "Y Distance"]));
             enter |= number(ui, "Angle", angle);
@@ -835,12 +841,12 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             }
             ("sketch.offset", params)
         }
-        Mod::Blend { a_tension, b_tension, editing, target } => {
+        Mod::Blend { a_tension, b_tension, a_flip, b_flip, editing, target } => {
             // Editing reuses the recorded joints and tangents; only the tensions come from here.
             let ta = value(app, a_tension, ValueKind::Unitless, "Tension 1")?;
             let tb = value(app, b_tension, ValueKind::Unitless, "Tension 2")?;
             if let Some(id) = editing {
-                let mut params = json!({"edit": id, "a_tension": ta, "b_tension": tb});
+                let mut params = json!({"edit": id, "a_tension": ta, "b_tension": tb, "a_flip": a_flip, "b_flip": b_flip});
                 // The blend may live in a sketch that is not the one being edited.
                 if let Some(sketch) = target {
                     params["sketch"] = json!(sketch);
@@ -874,6 +880,8 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                 "b_tangent": tangent_of(3, "Tangent 2")?,
                 "a_tension": ta,
                 "b_tension": tb,
+                "a_flip": a_flip,
+                "b_flip": b_flip,
             });
             ("sketch.blend3d", params)
         }

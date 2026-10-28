@@ -80,6 +80,9 @@ pub struct BlendEnd {
     pub at: BlendPlace,
     pub tangent: BlendTangent,
     pub tension: f64,
+    /// The tangent runs the other way at this joint.
+    #[serde(default)]
+    pub flip: bool,
 }
 
 /// Where a blend joins: a curve end, a sketch point, or a fixed place.

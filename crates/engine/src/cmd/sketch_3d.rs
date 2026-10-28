@@ -406,6 +406,9 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
     // Editing an existing blend: its joints and tangents are already recorded, so only the
     // tension changes are read from the parameters.
     let edit_id = p.get("edit").and_then(Value::as_str).map(str::to_string);
+    // Each joint may run its tangent the other way.
+    // Each joint may run its tangent the other way. Left unset, an edit keeps what was recorded.
+    let (fa, fb) = (p.get("a_flip").and_then(Value::as_bool), p.get("b_flip").and_then(Value::as_bool));
     let cont = p.get("continuity").and_then(Value::as_str).unwrap_or("g1").to_ascii_lowercase();
     if !matches!(cont.as_str(), "g0" | "g1") {
         return Err(bad(cmd, format!("continuity `{cont}` is not supported: a drawn 3D curve stores no curvature, so only g0 and g1 can be met")));
@@ -471,6 +474,7 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
                     at: solidcraft_sketch::BlendPlace::World(at),
                     tangent: solidcraft_sketch::BlendTangent::Handle(dir),
                     tension: 1.0,
+                    flip: false,
                 };
                 let (a, b) = (control[0], control[n - 1]);
                 Some(solidcraft_sketch::Blend {
@@ -484,7 +488,11 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
                 (None, Some(control)) => fallback(&control).ok_or_else(|| bad(cmd, format!("`{id}` is not a blend curve")))?,
                 (None, None) => return Err(bad(cmd, format!("`{id}` is not a blend curve"))),
             };
-            let spec = Blend { a: BlendEnd { tension: ta, ..stored.a }, b: BlendEnd { tension: tb, ..stored.b }, continuity: stored.continuity };
+            let spec = Blend {
+                a: BlendEnd { tension: ta, flip: fa.unwrap_or(stored.a.flip), ..stored.a },
+                b: BlendEnd { tension: tb, flip: fb.unwrap_or(stored.b.flip), ..stored.b },
+                continuity: stored.continuity,
+            };
             let (pa, dir_a) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.a, cmd)?;
             let (pb, dir_b) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.b, cmd)?;
             let l = pa.dist(pb);
@@ -496,8 +504,9 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
             let control: Vec<Vec3> = if spec.continuity == 0 {
                 vec![pa, pb]
             } else {
-                let d0 = orient(dir_a) * (l / 3.0 * spec.a.tension);
-                let d1 = orient(dir_b) * (l / 3.0 * spec.b.tension);
+                let turn = |d: Vec3, flip: bool| if flip { d * -1.0 } else { d };
+                let d0 = turn(orient(dir_a), spec.a.flip) * (l / 3.0 * spec.a.tension);
+                let d1 = turn(orient(dir_b), spec.b.flip) * (l / 3.0 * spec.b.tension);
                 solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1]).ok_or_else(|| bad(cmd, "the blend curve could not be rebuilt"))?
             };
             sk.set_blend(id, &control, spec)?;
@@ -555,7 +564,9 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
                 Some(r) => referenced_tangent(sk, &state, &inverse, &forward, r, pb, cmd)?,
                 None => unit(fallback(in_b, false)).ok_or_else(|| bad(cmd, "the second joint has no tangent: pick an edge or curve for it"))?,
             };
-            let (d0, d1) = (orient(dir_a) * (l / 3.0 * ta), orient(dir_b) * (l / 3.0 * tb));
+            let (fa, fb) = (fa.unwrap_or(false), fb.unwrap_or(false));
+            let turn = |d: Vec3, flip: bool| if flip { d * -1.0 } else { d };
+            let (d0, d1) = (turn(orient(dir_a), fa) * (l / 3.0 * ta), turn(orient(dir_b), fb) * (l / 3.0 * tb));
             solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1])
                 .ok_or_else(|| bad(cmd, "the blend curve could not be built from the tangents at both ends"))?
         };
@@ -588,8 +599,8 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
         };
         let (at_a, at_b) = (place(&ra, &pa_at, pa), place(&rb, &pb_at, pb));
         let spec = Blend {
-            a: BlendEnd { at: at_a.clone(), tangent: tangent(&ta_ref, &at_a)?, tension: ta },
-            b: BlendEnd { at: at_b.clone(), tangent: tangent(&tb_ref, &at_b)?, tension: tb },
+            a: BlendEnd { at: at_a.clone(), tangent: tangent(&ta_ref, &at_a)?, tension: ta, flip: fa.unwrap_or(false) },
+            b: BlendEnd { at: at_b.clone(), tangent: tangent(&tb_ref, &at_b)?, tension: tb, flip: fb.unwrap_or(false) },
             continuity: if cont == "g0" { 0 } else { 1 },
         };
         let id = sk.add_drawn_bezier_in(&control, WireSpace::Component)?;
