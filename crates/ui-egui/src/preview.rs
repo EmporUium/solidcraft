@@ -57,6 +57,8 @@ pub struct SketchPreview {
     pub sketch: std::sync::Arc<solidcraft_engine::doc::SolvedSketch>,
     pub curves: Vec<usize>,
     pub points: Vec<usize>,
+    /// Drawn 3D curves the command adds or changes: a blend is one of these, not a curve.
+    pub wires: Vec<usize>,
 }
 
 /// A computed preview: the scene to draw and the bodies it stands in for.
@@ -703,7 +705,23 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
                 .enumerate()
                 .filter_map(|(i, p)| if old_points.get(p.id.as_str()) == Some(&p.pos) { None } else { Some(i) })
                 .collect::<Vec<_>>();
-            if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
+            let old_wires: std::collections::HashMap<_, _> =
+                old.into_iter().flat_map(|s| s.sketch.wires.iter().map(|w| (w.id.as_str(), w))).collect();
+            let wires = sketch
+                .sketch
+                .wires
+                .iter()
+                .enumerate()
+                .filter_map(|(index, wire)| {
+                    let unchanged = old_wires.get(wire.id.as_str()).is_some_and(|previous| previous.pts == wire.pts);
+                    if unchanged { None } else { Some(index) }
+                })
+                .collect::<Vec<_>>();
+            if indices.is_empty() && points.is_empty() && wires.is_empty() {
+                None
+            } else {
+                Some(SketchPreview { sketch: sketch.clone(), curves: indices, points, wires })
+            }
         })
         .collect();
     Built { scene: sc, sketches, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new(), stopped: None }
@@ -845,6 +863,15 @@ pub fn paint_sketches(app: &SolveApp, painter: &egui::Painter, proj: &crate::vie
         for index in &preview.curves {
             crate::tools::paint_curve(&sketch.sketch, *index, &sketch.plane, painter, proj, stroke, &mut budget);
             curves += 1;
+        }
+        for index in &preview.wires {
+            if let Some(wire) = sketch.sketch.wires.get(*index) {
+                let pts: Vec<egui::Pos2> = wire.pts.iter().filter_map(|q| proj.to_screen(*q)).collect();
+                for seg in pts.windows(2) {
+                    painter.line_segment([seg[0], seg[1]], stroke);
+                }
+                curves += 1;
+            }
         }
         for index in &preview.points {
             if let Some(point) = sketch.sketch.point(*index).and_then(|p| proj.to_screen(sketch.plane.to_world(p))) {
