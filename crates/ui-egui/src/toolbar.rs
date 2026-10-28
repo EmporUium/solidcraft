@@ -2152,7 +2152,8 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                 if crate::select_other::is_open(app) {
                     crate::select_other::close(app);
                 } else if app.tool.is_some() {
-                    crate::tools::finish(app);
+                    // Esc abandons the tool: no curve is built by leaving.
+                    crate::tools::cancel(app);
                 } else if app.dialog.is_some() || app.pending_feature_edit.is_some() {
                     crate::dialogs::cancel(app);
                 } else if !app.session.selection.is_empty() || app.session.active_sketch.is_none() {

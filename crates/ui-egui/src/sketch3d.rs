@@ -39,7 +39,17 @@ pub fn active(app: &SolveApp) -> bool {
 }
 
 fn takes(cmd: &str) -> bool {
-    matches!(cmd, "sketch.line" | "sketch.arc.three_point" | "sketch.arc3d" | "sketch.spline.fit_point" | "sketch.point")
+    matches!(
+        cmd,
+        "sketch.line"
+            | "sketch.line3d"
+            | "sketch.arc.three_point"
+            | "sketch.arc3d"
+            | "sketch.spline.fit_point"
+            | "sketch.spline3d"
+            | "sketch.point"
+            | "sketch.point3d"
+    )
 }
 
 /// Only 3D point-placing tools broaden sketch-point picking; ordinary selection stays local.
@@ -123,28 +133,74 @@ pub fn on_hover(app: &SolveApp, proj: &Proj, pos: Pos2) {
     HOVER.with(|x| *x.borrow_mut() = h);
 }
 
-/// A click while a drawing tool is active in a 3D sketch (true: handled here).
+/// The commands that only exist in 3D: starting one implies the sketch's 3D option.
+fn is_3d_tool(cmd: &str) -> bool {
+    matches!(cmd, "sketch.line3d" | "sketch.spline3d" | "sketch.arc3d" | "sketch.point3d")
+}
+
+/// Handle a click while a 3D drawing tool is active.
+///
+/// Args:
+///     app: The running application.
+///     tool: The active tool; its command decides what the click does.
+///     proj: The projection the click was made in.
+///     pos: The click position, in screen coordinates.
+///
+/// Returns:
+///     True when this module handled the click, so the caller must not fall back to the 2D path.
 pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) -> bool {
-    if !takes(tool.cmd) || !active(app) {
+    if !takes(tool.cmd) {
         return false;
     }
-    let Some((p, _)) = point_at(app, proj, pos) else { return true };
+    if !active(app) {
+        // A pure 3D tool turns the 3D option on rather than silently falling back to the plane
+        // path, which only produces "points must list [x,y,z]" errors.
+        if !is_3d_tool(tool.cmd) || app.session.active_sketch.is_none() {
+            return false;
+        }
+        if app.run("sketch.options", json!({ "sketch_3d": true })).is_err() || !active(app) {
+            return false;
+        }
+    }
+    let p = match point_at(app, proj, pos) {
+        Some((p, _)) => p,
+        None if is_3d_tool(tool.cmd) => {
+            // A ray parallel enough to the plane never meets it: place the point along the ray
+            // at the depth of the previous pick (or a sensible default) so the click still lands.
+            let (o, d) = proj.ray(pos);
+            let dist = chain().last().map(|c| (*c - o).dot(d).max(1.0)).unwrap_or(100.0);
+            o + d * dist
+        }
+        None => return true,
+    };
     if CHAIN.with(|c| c.borrow().0) != Some(tool.cmd) {
         set_chain(Some(tool.cmd), Vec::new());
     }
+    // A click on (or behind) the previous point adds nothing and makes the curve invalid.
+    if chain().last().is_some_and(|q| (*q - p).len() < 1e-6) {
+        return true;
+    }
     match tool.cmd {
-        "sketch.point" => {
-            let r = match on_plane(app, p) {
-                Some(q) => app.run("sketch.point", json!({"point": [q.x, q.y]})),
-                None => app.run("sketch.point3d", json!({"point": [p.x, p.y, p.z]})),
+        "sketch.point" | "sketch.point3d" => {
+            let r = if tool.cmd == "sketch.point3d" {
+                app.run("sketch.point3d", json!({"point": [p.x, p.y, p.z]}))
+            } else {
+                match on_plane(app, p) {
+                    Some(q) => app.run("sketch.point", json!({"point": [q.x, q.y]})),
+                    None => app.run("sketch.point3d", json!({"point": [p.x, p.y, p.z]})),
+                }
             };
             report(app, r);
         }
-        "sketch.line" => {
+        "sketch.line" | "sketch.line3d" => {
             if let Some(a) = chain().last().copied() {
-                let r = match (on_plane(app, a), on_plane(app, p)) {
-                    (Some(qa), Some(qb)) => app.run("sketch.line", json!({"points": [[qa.x, qa.y], [qb.x, qb.y]], "infer": true})),
-                    _ => app.run("sketch.line3d", json!({"points": [[a.x, a.y, a.z], [p.x, p.y, p.z]]})),
+                let r = if tool.cmd == "sketch.line3d" {
+                    app.run("sketch.line3d", json!({"points": [[a.x, a.y, a.z], [p.x, p.y, p.z]]}))
+                } else {
+                    match (on_plane(app, a), on_plane(app, p)) {
+                        (Some(qa), Some(qb)) => app.run("sketch.line", json!({"points": [[qa.x, qa.y], [qb.x, qb.y]], "infer": true})),
+                        _ => app.run("sketch.line3d", json!({"points": [[a.x, a.y, a.z], [p.x, p.y, p.z]]})),
+                    }
                 };
                 report(app, r);
             }
@@ -184,7 +240,12 @@ fn report(app: &mut SolveApp, r: Result<Value, String>) {
     }
 }
 
-/// Right-click / Esc while drawing in 3D: a spline is made from its points, a line chain ends
+/// Esc: drop the pending 3D chain without building anything.
+pub fn cancel() {
+    set_chain(None, Vec::new());
+}
+
+/// Right click: end the current chain (a spline is made from its points, a line chain ends).
 /// (true: handled here; the tool stays for the next curve).
 pub fn finish(app: &mut SolveApp) -> bool {
     let (cmd, pts) = CHAIN.with(|c| c.borrow().clone());
@@ -196,8 +257,24 @@ pub fn finish(app: &mut SolveApp) -> bool {
         set_chain(None, Vec::new());
         return false;
     }
-    if cmd == "sketch.spline.fit_point" && pts.len() >= 2 {
-        let r = if pts.iter().all(|p| on_plane(app, *p).is_some()) {
+    // Coincident picks cannot make a curve; drop them and end quietly rather than erroring.
+    let mut clean: Vec<Vec3> = Vec::new();
+    for p in &pts {
+        if clean.last().is_none_or(|q: &Vec3| (*q - *p).len() > 1e-6) {
+            clean.push(*p);
+        }
+    }
+    if clean.len() < 2 {
+        set_chain(None, Vec::new());
+        app.tool = None;
+        return true;
+    }
+    let pts = clean;
+    if (cmd == "sketch.spline.fit_point" || cmd == "sketch.spline3d") && pts.len() >= 2 {
+        let r = if cmd == "sketch.spline3d" {
+            let q: Vec<Value> = pts.iter().map(|p| json!([p.x, p.y, p.z])).collect();
+            app.run("sketch.spline3d", json!({ "points": q }))
+        } else if pts.iter().all(|p| on_plane(app, *p).is_some()) {
             let q: Vec<Value> = pts.iter().filter_map(|p| on_plane(app, *p)).map(|q| json!([q.x, q.y])).collect();
             app.run("sketch.spline.fit_point", json!({ "points": q }))
         } else {
@@ -205,6 +282,12 @@ pub fn finish(app: &mut SolveApp) -> bool {
             app.run("sketch.spline3d", json!({ "points": q }))
         };
         report(app, r);
+        // A 3D spline is one curve: finishing it ends the tool, so one right-click is enough.
+        if cmd == "sketch.spline3d" {
+            set_chain(None, Vec::new());
+            app.tool = None;
+            return true;
+        }
     }
     set_chain(Some(cmd), Vec::new());
     true

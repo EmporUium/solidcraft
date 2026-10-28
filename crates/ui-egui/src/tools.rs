@@ -97,6 +97,9 @@ impl Tool {
     pub fn for_command(id: &str) -> Option<Tool> {
         let (cmd, kind): (&'static str, Kind) = match id {
             "sketch.line" => ("sketch.line", Kind::Draw(0)),
+            "sketch.line3d" => ("sketch.line3d", Kind::Draw(0)),
+            "sketch.spline3d" => ("sketch.spline3d", Kind::Draw(0)),
+            "sketch.point3d" => ("sketch.point3d", Kind::Draw(1)),
             "sketch.rectangle.two_point" => ("sketch.rectangle.two_point", Kind::Draw(2)),
             "sketch.rectangle.center" => ("sketch.rectangle.center", Kind::Draw(2)),
             "sketch.rectangle.rounded" => ("sketch.rectangle.rounded", Kind::Draw(2)),
@@ -145,6 +148,9 @@ impl Tool {
 pub fn hint(id: &str) -> String {
     match id {
         "sketch.line" => "Line: click points; right-click or Esc to finish".into(),
+        "sketch.line3d" => "3D Line: click points in space; right-click or Esc to end the chain".into(),
+        "sketch.spline3d" => "3D Spline: click points in space; right-click or Esc finishes the curve and ends the tool".into(),
+        "sketch.point3d" => "3D Point: click a point in space; right-click or Esc ends the tool".into(),
         "sketch.rectangle.two_point" => "Rectangle: click two opposite corners".into(),
         "sketch.rectangle.center" => "Center rectangle: click the centre, then a corner".into(),
         "sketch.rectangle.rounded" => "Rounded rectangle: click two opposite corners (Tab to the radius box to type the corner radius)".into(),
@@ -772,7 +778,22 @@ pub fn undo_spline_point(app: &mut SolveApp) -> bool {
     true
 }
 
-/// Right click / Esc: end the current chain (line) or cancel the tool.
+/// **Esc: abandon the current chain and the tool, creating nothing.**
+///
+/// Right-click finishes (it builds the curve, as [`finish`] does); Esc is the way out of a
+/// chain the user does not want, and it must never commit geometry as a side effect.
+pub fn cancel(app: &mut SolveApp) {
+    crate::dim_view::cancel();
+    crate::sketch3d::cancel();
+    if let Some(t) = app.tool.as_mut() {
+        t.pts.clear();
+        t.picks.clear();
+        crate::sketch_dims::reset(t);
+    }
+    app.tool = None;
+}
+
+/// Right click: end the current chain (line) or close the tool.
 pub fn finish(app: &mut SolveApp) {
     crate::dim_view::cancel();
     if crate::sketch3d::finish(app) {
