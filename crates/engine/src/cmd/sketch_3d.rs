@@ -13,15 +13,25 @@ use crate::params::{bad, req_vec3, vec3};
 use crate::{Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("sketch.line3d", "3D Line", line3d).icon("line").enabled(in_sketch).params(concat!(
+    CommandSpec::new("sketch.line3d", "3D Line", line3d).at("SKETCH", "3D").icon("line").enabled(in_sketch_3d).params(concat!(
         "points: [[x,y,z]…] world points (2 or more): one 3D line per segment, joined end to end (needs 3D Sketch on)",
         created_doc!()
     )),
     CommandSpec::new("sketch.spline3d", "3D Spline", spline3d)
+        .at("SKETCH", "3D")
         .icon("spline")
-        .enabled(in_sketch)
+        .enabled(in_sketch_3d)
         .params(concat!("points: [[x,y,z]…] world fit points (2 or more): a smooth 3D curve through them (needs 3D Sketch on)", created_doc!())),
+    CommandSpec::new("sketch.blend3d", "3D Blend Curve", blend3d)
+        .at("SKETCH", "3D")
+        .icon("blend")
+        .enabled(in_sketch_3d)
+        .params(concat!(
+            "a, b: curve end points as `w1.start` or `w1.end`, continuity?: g0 | g1 (default g1), a_tension?, b_tension?: handle length at each joint as a multiple of a third of the span (default 1, 0.01 to 100): one 3D curve joined to both, tangent to each at the joint when g1 (needs 3D Sketch on)",
+            created_doc!()
+        )),
     CommandSpec::new("sketch.arc3d", "3D Arc", arc3d)
+        .at("SKETCH", "3D")
         .icon("arc3")
         .enabled(in_sketch_3d)
         .params(concat!(
@@ -29,8 +39,9 @@ pub static COMMANDS: &[CommandSpec] = &[
             created_doc!()
         )),
     CommandSpec::new("sketch.point3d", "3D Point", point3d)
+        .at("SKETCH", "3D")
         .icon("point")
-        .enabled(in_sketch)
+        .enabled(in_sketch_3d)
         .params(concat!("point: [x,y,z] world point (needs 3D Sketch on)", created_doc!())),
     CommandSpec::new("sketch.move3d", "Move 3D Point", move3d)
         .icon("sketch_move")
@@ -117,6 +128,315 @@ fn spline3d(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(sk.add_drawn_wire_in(&pts, WireSpace::Component)?)
     })?;
     Ok(json!({"curves": [id], "sketch": info}))
+}
+
+/// The joinable ends of the sketch, in component coordinates.
+///
+/// Args:
+///     sk: The sketch being edited.
+///
+/// Returns:
+///     One `(ref, point, direction into the curve)` per end, for drawn 3D wires and 2D curves
+///     alike. `ref` is what the command takes, such as `w1.end` or `l4.start`.
+fn sketch_ends(sk: &solidcraft_sketch::Sketch) -> Vec<(String, Vec3, Vec3)> {
+    let mut out = Vec::with_capacity(2 * (sk.wires.len() + sk.curves.len()));
+    for w in &sk.wires {
+        let n = w.fit.len();
+        if n < 2 {
+            continue;
+        }
+        out.push((format!("{}.start", w.id), w.fit[0], w.fit[1] - w.fit[0]));
+        out.push((format!("{}.end", w.id), w.fit[n - 1], w.fit[n - 2] - w.fit[n - 1]));
+    }
+    for (ci, c) in sk.curves.iter().enumerate() {
+        let poly = sk.polyline(ci);
+        let n = poly.len();
+        if n < 2 {
+            continue;
+        }
+        let v = |q: solidcraft_geom::Vec2| Vec3::new(q.x, q.y, 0.0);
+        out.push((format!("{}.start", c.id), v(poly[0]), v(poly[1] - poly[0])));
+        out.push((format!("{}.end", c.id), v(poly[n - 1]), v(poly[n - 2] - poly[n - 1])));
+    }
+    out
+}
+
+/// Look a named end up among [`sketch_ends`].
+///
+/// Args:
+///     ends: The sketch's ends, as returned by [`sketch_ends`].
+///     reference: An end reference such as `w1.start` or `l2.end`.
+///     cmd: The command id, for error messages.
+///
+/// Returns:
+///     The joint's position and the direction from it into the curve.
+fn named_end(ends: &[(String, Vec3, Vec3)], reference: &str, cmd: &str) -> Result<(Vec3, Vec3)> {
+    if !reference.contains('.') {
+        return Err(bad(cmd, format!("`{reference}` must be a curve end such as `w1.end` or `l2.start`")));
+    }
+    ends.iter()
+        .find(|(id, _, _)| id == reference)
+        .map(|(_, at, into)| (*at, *into))
+        .ok_or_else(|| bad(cmd, format!("no curve ends at `{reference}`")))
+}
+
+/// The edge ends of the evaluated model nearest to each of `points`, in world coordinates.
+///
+/// One pass over every body's edges answers every point, so picking two ends costs one walk of
+/// the model rather than one per end.
+///
+/// Args:
+///     st: The model as it stood before the sketch being edited.
+///     points: World points to find the nearest edge end to.
+///
+/// Returns:
+///     For each point, the nearest `(position, direction into the edge)`, or `None` when the
+///     model has no edges.
+fn nearest_model_ends(st: &solidcraft_doc::ModelState, points: &[Vec3]) -> Vec<Option<(Vec3, Vec3)>> {
+    let mut best: Vec<Option<(f64, Vec3, Vec3)>> = vec![None; points.len()];
+    if points.is_empty() {
+        return Vec::new();
+    }
+    for body in &st.bodies {
+        let m = body.mesh();
+        for e in &m.edges {
+            let n = e.len();
+            if n < 2 {
+                continue;
+            }
+            for (at, into) in [(e[0], e[1] - e[0]), (e[n - 1], e[n - 2] - e[n - 1])] {
+                for (i, p) in points.iter().enumerate() {
+                    let d = at.dist(*p);
+                    if best[i].as_ref().is_none_or(|(bd, _, _)| d < *bd) {
+                        best[i] = Some((d, at, into));
+                    }
+                }
+            }
+        }
+    }
+    best.into_iter().map(|b| b.map(|(_, at, into)| (at, into))).collect()
+}
+
+/// The direction of the polyline nearest to `at`, with its distance from it.
+///
+/// Args:
+///     pts: The polyline to search, in the same space as `at`.
+///     at: The point to measure from.
+///
+/// Returns:
+///     The distance to the nearest segment and that segment's unit direction, or `None` when the
+///     polyline has fewer than two points.
+fn nearest_segment_dir(pts: &[Vec3], at: Vec3) -> Option<(f64, Vec3)> {
+    let mut best: Option<(f64, Vec3)> = None;
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let seg = b - a;
+        let len2 = seg.len() * seg.len();
+        if len2 < 1e-18 {
+            continue;
+        }
+        let t = ((at - a).dot(seg) / len2).clamp(0.0, 1.0);
+        let d = (at - (a + seg * t)).len();
+        if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+            best = unit(seg).map(|u| (d, u)).or(Some((d, Vec3::ZERO)));
+        }
+    }
+    best
+}
+
+/// The tangent an edge or curve supplies at one joint.
+///
+/// A corner can have several edges meeting it, so the reference names the chosen one rather than
+/// relying on which is nearest: a sketch curve by id (`l3`), or a model edge by body and index
+/// (`{body, edge}`). The direction is taken at the point of that edge nearest the joint.
+///
+/// Args:
+///     sk: The sketch being edited.
+///     st: The model as it stood before the sketch.
+///     inverse: World-to-sketch transform.
+///     forward: Sketch-to-world transform, for measuring model edges.
+///     reference: `l3`, or `{"body": "Body1", "edge": 4}`.
+///     joint: The joint position, in the sketch's coordinates.
+///     cmd: The command id, for error messages.
+///
+/// Returns:
+///     The unit direction of that edge at the joint, in sketch coordinates.
+fn referenced_tangent(
+    sk: &solidcraft_sketch::Sketch,
+    st: &solidcraft_doc::ModelState,
+    inverse: &solidcraft_doc::Mat,
+    forward: &solidcraft_doc::Mat,
+    reference: &Value,
+    joint: Vec3,
+    cmd: &str,
+) -> Result<Vec3> {
+    if let Some(id) = reference.as_str() {
+        let ci = sk.curve_index(id).ok_or_else(|| bad(cmd, format!("no sketch curve `{id}` to take the tangent from")))?;
+        let poly: Vec<Vec3> = sk.polyline(ci).into_iter().map(|q| Vec3::new(q.x, q.y, 0.0)).collect();
+        return nearest_segment_dir(&poly, joint)
+            .and_then(|(_, dir)| unit(dir))
+            .ok_or_else(|| bad(cmd, format!("`{id}` has no direction at the joint")));
+    }
+    let body = reference.get("body").and_then(Value::as_str).ok_or_else(|| bad(cmd, "a tangent must be a sketch curve id or {body, edge}"))?;
+    let edge = reference
+        .get("edge")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| bad(cmd, "`edge` must be an edge index"))?;
+    let m =
+        st.bodies.iter().find(|b| b.name == body).map(|b| b.mesh()).ok_or_else(|| bad(cmd, format!("no body `{body}` to take the tangent from")))?;
+    let e = m.edges.get(edge).ok_or_else(|| bad(cmd, format!("`{body}` has no edge {edge}")))?;
+    nearest_segment_dir(e, solidcraft_doc::apply_point(forward, joint))
+        .and_then(|(_, dir)| unit(solidcraft_doc::apply_vector(inverse, dir)))
+        .ok_or_else(|| bad(cmd, format!("edge {edge} of `{body}` has no direction at the joint")))
+}
+
+/// Unit vector, or `None` when `v` is too short to have a direction.
+fn unit(v: Vec3) -> Option<Vec3> {
+    let l = v.len();
+    (l > 1e-12).then(|| v * (1.0 / l))
+}
+
+/// Parse one joint parameter, which the dialog sends as `{"at": [x,y,z]}` or `{"point": "p3"}`
+/// and a script may send as a bare world point.
+fn joint_param(p: &Value, k: &str, cmd: &str) -> Result<JointInput> {
+    let v = p.get(k).ok_or_else(|| bad(cmd, format!("`{k}` is missing: give a point or vertex")))?;
+    if let Some(at) = vec3(v) {
+        return Ok(JointInput::At(at));
+    }
+    if let Some(id) = v.get("point").and_then(Value::as_str) {
+        return Ok(JointInput::Point(id.to_string()));
+    }
+    v.get("at").and_then(vec3).map(JointInput::At).ok_or_else(|| bad(cmd, format!("`{k}` must be [x,y,z], {{at: [x,y,z]}} or {{point: id}}")))
+}
+
+/// A joint as the caller gave it: either a place or the id of a sketch point.
+enum JointInput {
+    At(Vec3),
+    Point(String),
+}
+
+/// Join two curve or model-edge ends with one 3D curve, tangent to each at its joint.
+///
+/// Each end is either named (`a` / `b`, such as `w1.end`) or given as the world point the user
+/// clicked (`a_at` / `b_at`), in which case the nearest sketch curve end or model edge end is
+/// used. A tension above or below 1 lengthens or shortens that joint's handle.
+///
+/// Args:
+///     s: The session to edit.
+///     p: Command parameters — `a`, `b` or `a_at`, `b_at`, plus optional `continuity`,
+///         `a_tension` and `b_tension`.
+///
+/// Returns:
+///     `{curves: [id], sketch: …}` with the blend's id.
+fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "sketch.blend3d";
+    let cont = p.get("continuity").and_then(Value::as_str).unwrap_or("g1").to_ascii_lowercase();
+    if !matches!(cont.as_str(), "g0" | "g1") {
+        return Err(bad(cmd, format!("continuity `{cont}` is not supported: a drawn 3D curve stores no curvature, so only g0 and g1 can be met")));
+    }
+    // Handle length at each joint, as a multiple of the third of the span. 1 is the neutral blend.
+    let tension = |k: &str| -> Result<f64> {
+        let t = p.get(k).and_then(Value::as_f64).unwrap_or(1.0);
+        if !(0.01..=100.0).contains(&t) {
+            return Err(bad(cmd, format!("`{k}` must be between 0.01 and 100")));
+        }
+        Ok(t)
+    };
+    let (ta, tb) = (tension("a_tension")?, tension("b_tension")?);
+    // Either name the two ends, or give the two world points the user clicked.
+    let ra = p.get("a").and_then(Value::as_str).map(str::to_string);
+    let rb = p.get("b").and_then(Value::as_str).map(str::to_string);
+    let pa_at = if ra.is_none() { Some(joint_param(p, "a_at", cmd)?) } else { None };
+    let pb_at = if rb.is_none() { Some(joint_param(p, "b_at", cmd)?) } else { None };
+    // The tangent at each joint is its own pick — the specific edge the user chose, since a
+    // corner can have several. Without one the curve at the joint supplies its own direction.
+    let ta_ref = p.get("a_tangent").filter(|v| !v.is_null()).cloned();
+    let tb_ref = p.get("b_tangent").filter(|v| !v.is_null()).cloned();
+    let inverse = inverse_owner_frame(s, p, cmd)?;
+    let forward = solidcraft_doc::mat_inverse(&inverse).unwrap_or_default();
+    // The model as it stands before this sketch: the edges the user picked on a solid. Both
+    // clicks are answered from a single walk of it, outside the edit.
+    let state = s.model.state_before(target_sketch(s, p, cmd)?);
+    let clicks: Vec<Vec3> = [&pa_at, &pb_at]
+        .into_iter()
+        .filter_map(|j| match j {
+            Some(JointInput::At(at)) => Some(*at),
+            _ => None,
+        })
+        .collect();
+    let model_hits = nearest_model_ends(&state, &clicks);
+    let model_of = |at: &Option<JointInput>| -> Option<(Vec3, Vec3)> {
+        let at = match at {
+            Some(JointInput::At(at)) => *at,
+            _ => return None,
+        };
+        let i = clicks.iter().position(|c| c.dist(at) < 1e-12)?;
+        model_hits.get(i).copied().flatten()
+    };
+    let (ma, mb) = (model_of(&pa_at), model_of(&pb_at));
+    let (id, info) = edit(s, p, cmd, false, |sk, _| {
+        needs_3d(sk, cmd)?;
+        let ends = sketch_ends(sk);
+        // A click may land on a sketch curve or on an edge of the model. Whichever end is nearer
+        // to the click wins; both are compared in the sketch's own coordinates.
+        let pick = |at: Vec3, model: Option<(Vec3, Vec3)>| -> Result<(Vec3, Vec3)> {
+            let comp = solidcraft_doc::apply_point(&inverse, at);
+            let sketch_hit = ends.iter().map(|(_, at, into)| (at.dist(comp), *at, *into)).min_by(|a, b| a.0.total_cmp(&b.0));
+            let model_hit = model.map(|(at, into)| {
+                let (cq, cd) = (solidcraft_doc::apply_point(&inverse, at), solidcraft_doc::apply_vector(&inverse, into));
+                (cq.dist(comp), cq, cd)
+            });
+            match (sketch_hit, model_hit) {
+                (Some(s), Some(m)) if m.0 < s.0 => Ok((m.1, m.2)),
+                (Some(s), _) => Ok((s.1, s.2)),
+                (None, Some(m)) => Ok((m.1, m.2)),
+                (None, None) => Err(bad(cmd, "nothing to blend here: the sketch has no curves and the model no edges")),
+            }
+        };
+        let resolve = |r: &Option<String>, at: &Option<JointInput>, model: Option<(Vec3, Vec3)>| -> Result<(Vec3, Vec3)> {
+            match (r, at) {
+                (Some(r), _) => named_end(&ends, r, cmd),
+                (None, Some(JointInput::Point(id))) => {
+                    let i = sk.point_index(id).ok_or_else(|| bad(cmd, format!("no sketch point `{id}`")))?;
+                    let q = sk.point(i).ok_or_else(|| bad(cmd, format!("no sketch point `{id}`")))?;
+                    // A named point carries no direction of its own; its tangent is the pick.
+                    Ok((Vec3::new(q.x, q.y, 0.0), Vec3::ZERO))
+                }
+                (None, Some(JointInput::At(at))) => pick(*at, model),
+                (None, None) => Err(bad(cmd, "give `a` and `b`, or `a_at` and `b_at`")),
+            }
+        };
+        let (pa, in_a) = resolve(&ra, &pa_at, ma)?;
+        let (pb, in_b) = resolve(&rb, &pb_at, mb)?;
+        let l = pa.dist(pb);
+        if l < 1e-9 {
+            return Err(bad(cmd, "the two ends must differ"));
+        }
+        let control: Vec<Vec3> = if cont == "g0" {
+            vec![pa, pb]
+        } else {
+            // A picked tangent wins; otherwise the curve runs on out of `a` and into `b`. Either
+            // way it is oriented to leave one joint and reach the other, and scaled by the span
+            // and the joint's tension.
+            let span = pb - pa;
+            let orient = |d: Vec3| if d.dot(span) < 0.0 { d * -1.0 } else { d };
+            let fallback = |into: Vec3, leaving: bool| if leaving { into * -1.0 } else { into };
+            let dir_a = match &ta_ref {
+                Some(r) => referenced_tangent(sk, &state, &inverse, &forward, r, pa, cmd)?,
+                None => unit(fallback(in_a, true)).ok_or_else(|| bad(cmd, "the first joint has no tangent: pick an edge or curve for it"))?,
+            };
+            let dir_b = match &tb_ref {
+                Some(r) => referenced_tangent(sk, &state, &inverse, &forward, r, pb, cmd)?,
+                None => unit(fallback(in_b, false)).ok_or_else(|| bad(cmd, "the second joint has no tangent: pick an edge or curve for it"))?,
+            };
+            let (d0, d1) = (orient(dir_a) * (l / 3.0 * ta), orient(dir_b) * (l / 3.0 * tb));
+            solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1])
+                .ok_or_else(|| bad(cmd, "the blend curve could not be built from the tangents at both ends"))?
+        };
+        Ok(sk.add_drawn_bezier_in(&control, WireSpace::Component)?)
+    })?;
+    Ok(json!({ "curves": [id], "sketch": info }))
 }
 
 fn arc3d(s: &mut Session, p: &Value) -> Result<Value> {

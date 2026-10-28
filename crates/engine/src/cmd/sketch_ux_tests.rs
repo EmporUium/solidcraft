@@ -1398,6 +1398,74 @@ fn three_d_curves_need_the_option_and_move_joined() {
 }
 
 #[test]
+fn blend3d_joins_two_curve_ends_tangent_to_both() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.options", json!({"sketch_3d": true}));
+    let a = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[0, 0, 0], [50, 0, 0]]})));
+    let b = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[100, 20, 0], [150, 20, 0]]})));
+    let r = run(&mut s, "sketch.blend3d", json!({"a": format!("{}.end", a[0]), "b": format!("{}.start", b[0])}));
+    let id = curve_ids(&r)[0].clone();
+    let sk = sketch(&s);
+    let w = &sk.wires[sk.wire_index(&id).expect("the blend")];
+    let fit = w.bezier.clone().expect("the blend keeps its control polygon");
+    assert_eq!(fit.len(), 4, "a G1 blend is a cubic: {}", fit.len());
+    // Only the joints are draggable sketch points; the handles are the curve's own.
+    assert_eq!(w.fit.len(), 2);
+    // Tangent at each joint: the first leg runs on from `a`'s direction, the last leg runs into
+    // `b`'s, and both references are along +X here.
+    let start = solidcraft_geom::Vec3::new(50.0, 0.0, 0.0);
+    let end = solidcraft_geom::Vec3::new(100.0, 20.0, 0.0);
+    assert!(fit[0].dist(start) < 1e-12);
+    assert!(fit[3].dist(end) < 1e-12);
+    let leg0 = fit[1] - fit[0];
+    let leg3 = fit[3] - fit[2];
+    assert!(leg0.x > 0.0 && leg0.y.abs() < 1e-12 && leg0.z.abs() < 1e-12, "start leg {leg0:?}");
+    assert!(leg3.x > 0.0 && leg3.y.abs() < 1e-12 && leg3.z.abs() < 1e-12, "end leg {leg3:?}");
+    // The samples are the Bézier, so both ends sit exactly on the wire.
+    assert!(w.pts.first().expect("p").dist(start) < 1e-9);
+    assert!(w.pts.last().expect("p").dist(end) < 1e-9);
+}
+
+#[test]
+fn blend3d_g0_is_a_straight_join_and_g2_is_refused() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.options", json!({"sketch_3d": true}));
+    let a = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[0, 0, 0], [10, 0, 0]]})));
+    let b = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[20, 10, 0], [30, 10, 0]]})));
+    let (ea, sb) = (format!("{}.end", a[0]), format!("{}.start", b[0]));
+    let r = run(&mut s, "sketch.blend3d", json!({"a": ea, "b": sb, "continuity": "g0"}));
+    let id = curve_ids(&r)[0].clone();
+    let sk = sketch(&s);
+    let fit = sk.wires[sk.wire_index(&id).expect("the blend")].fit.clone();
+    assert_eq!(fit.len(), 2);
+    assert!(s.execute("sketch.blend3d", &json!({"a": ea, "b": sb, "continuity": "g2"})).is_err());
+    assert!(s.execute("sketch.blend3d", &json!({"a": "nope.end", "b": sb})).is_err());
+    assert!(s.execute("sketch.blend3d", &json!({"a": format!("{}.middle", a[0]), "b": sb})).is_err());
+}
+
+#[test]
+fn blend3d_tension_scales_each_handle() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.options", json!({"sketch_3d": true}));
+    let a = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[0, 0, 0], [50, 0, 0]]})));
+    let b = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[100, 20, 0], [150, 20, 0]]})));
+    let (ea, sb) = (format!("{}.end", a[0]), format!("{}.start", b[0]));
+    let fit_of = |s: &Session, id: &str| {
+        let sk = sketch(s);
+        sk.wires[sk.wire_index(id).expect("the blend")].bezier.clone().expect("a control polygon")
+    };
+    let plain = curve_ids(&run(&mut s, "sketch.blend3d", json!({"a": ea, "b": sb})))[0].clone();
+    let tight = curve_ids(&run(&mut s, "sketch.blend3d", json!({"a": ea, "b": sb, "a_tension": 0.5, "b_tension": 2.0})))[0].clone();
+    let (p, t) = (fit_of(&s, &plain), fit_of(&s, &tight));
+    // Same joints, different handle lengths: half at `a`, double at `b`.
+    assert!((p[1] - p[0]).len() > 0.0);
+    assert!(((t[1] - t[0]).len() / (p[1] - p[0]).len() - 0.5).abs() < 1e-9);
+    assert!(((t[3] - t[2]).len() / (p[3] - p[2]).len() - 2.0).abs() < 1e-9);
+    assert!(t[0].dist(p[0]) < 1e-12 && t[3].dist(p[3]) < 1e-12);
+    assert!(s.execute("sketch.blend3d", &json!({"a": ea, "b": sb, "a_tension": 0.0})).is_err());
+}
+
+#[test]
 fn pipe_and_sweep_follow_3d_sketch_curves() {
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Path"}));

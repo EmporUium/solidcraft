@@ -214,9 +214,15 @@ pub const SECTIONS: &[Section] = &[
     Section { tab: "VIEW", panel: "SELECT", promoted: 0, ids: &[] },
     Section {
         tab: "SKETCH",
-        panel: "CREATE",
+        panel: "Create 2D",
         promoted: 4,
         ids: &["sketch.line", "sketch.rectangle.two_point", "sketch.circle.center", "sketch.arc.three_point", "sketch.infinite"],
+    },
+    Section {
+        tab: "SKETCH",
+        panel: "Create 3D",
+        promoted: 4,
+        ids: &["sketch.line3d", "sketch.spline3d", "sketch.arc3d", "sketch.point3d", "sketch.blend3d"],
     },
     Section {
         tab: "SKETCH",
@@ -431,7 +437,8 @@ pub const PLACEMENTS: &[(&str, &str, &str, &str)] = &[
     ("SURFACE", "CREATE", "SURFACE", "CREATE"),
     ("SURFACE", "MODIFY", "SURFACE", "EDIT"),
     ("SURFACE", "INSPECT", "INSPECT", "SURFACE QUALITY"),
-    ("SKETCH", "CREATE", "SKETCH", "CREATE"),
+    ("SKETCH", "3D", "SKETCH", "Create 3D"),
+    ("SKETCH", "CREATE", "SKETCH", "Create 2D"),
     ("SKETCH", "MODIFY", "SKETCH", "MODIFY"),
     ("SKETCH", "PATTERN", "SKETCH", "PATTERN"),
     ("SKETCH", "CONSTRAINTS", "SKETCH", "CONSTRAIN"),
