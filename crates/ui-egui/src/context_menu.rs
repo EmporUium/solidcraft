@@ -945,11 +945,29 @@ fn alignment_items(selection: &[Sel]) -> Vec<Item> {
     ]
 }
 
+/// The selected blend curve and the sketch it lives in, if one is selected. A blend records what
+/// built it, so it can be offered for editing even when its sketch is not being edited.
+fn blend_selected(app: &SolveApp) -> Option<(u64, String)> {
+    let st = app.session.world_state();
+    app.session.selection.iter().find_map(|sel| {
+        let Sel::SketchCurve { id, sketch } = sel else { return None };
+        st.sketches
+            .iter()
+            .filter(|ss| sketch.is_none_or(|k| ss.feature == k))
+            .find_map(|ss| ss.sketch.wires.iter().any(|w| &w.id == id && w.bezier.is_some()).then(|| (ss.feature, id.clone())))
+    })
+}
+
 /// Sketch entity items: construction, fix, delete, dimension and the constraints the selection
 /// can take.
 fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
     use solidcraft_engine::sketch::CurveKind;
-    let Some(sid) = app.session.active_sketch else { return Vec::new() };
+    let blend = blend_selected(app);
+    let Some(sid) = app.session.active_sketch else {
+        // Outside a sketch only the blend has anything to edit: everything else here needs the
+        // sketch the items belong to.
+        return blend.map(|_| vec![cmd(app, "sketch.blend3d", "Edit 3D Blend Curve")]).unwrap_or_default();
+    };
     let st = app.session.world_state();
     let Some(ss) = st.sketch(sid) else { return Vec::new() };
     if app.session.selection.iter().any(|sel| matches!(sel, Sel::SketchMidpoint { .. })) {
@@ -1116,6 +1134,9 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
     if !c.is_empty() {
         v.push(Item::heading("Constraints"));
         v.extend(c);
+    }
+    if blend.is_some() {
+        v.insert(0, cmd(app, "sketch.blend3d", "Edit 3D Blend Curve"));
     }
     v
 }
