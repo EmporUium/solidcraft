@@ -92,7 +92,9 @@ pub enum BlendPlace {
     Curve(String),
     /// A sketch point by id.
     Point(String),
-    /// A point with no sketch reference behind it.
+    /// A vertex of a body, kept by name so the dialog can show it again.
+    Vertex { body: String, point: Vec3 },
+    /// A point with no reference behind it.
     World(Vec3),
 }
 

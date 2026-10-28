@@ -139,7 +139,12 @@ pub enum Mod {
 
 impl Mod {
     pub fn previews(&self) -> bool {
-        matches!(self, Self::Mirror | Self::PatternRect { .. } | Self::PatternCirc { .. } | Self::Offset { .. } | Self::Corner { .. })
+        // A blend shows itself as soon as both joints and both tangents are picked, and follows
+        // the tensions and directions from there.
+        matches!(
+            self,
+            Self::Mirror | Self::PatternRect { .. } | Self::PatternCirc { .. } | Self::Offset { .. } | Self::Corner { .. } | Self::Blend { .. }
+        )
     }
 
     pub fn title(&self) -> &'static str {
@@ -203,7 +208,6 @@ fn inputs(k: &Mod) -> Vec<SelInput> {
         // dialog walks them in order and the next click fills the next field.
         // Editing an existing blend: its joints and tangents are recorded, so the window only
         // asks for the two tensions.
-        Mod::Blend { editing: Some(_), .. } => vec![],
         Mod::Blend { .. } => vec![
             SelInput::new("Point or vertex 1", VERTICES | SKETCH_POINTS | CURVES, false),
             SelInput::new("Tangent 1", EDGES | CURVES, false),
@@ -291,7 +295,37 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         "sketch.chamfer.distance_angle" => corner(true, 2),
         _ => return None,
     };
-    let i = inputs(&k);
+    let mut i = inputs(&k);
+    // An edited blend opens with the picks that made it, so any of the six can be changed.
+    if let Mod::Blend { editing: Some(id), .. } = &k
+        && let Some(sk) = app.session.active_sketch
+        && let Some(w) = app.session.doc.sketch(sk).ok().and_then(|s| s.wire_index(id).and_then(|i| s.wires.get(i).cloned()))
+        && let Some(b) = &w.blend
+    {
+        let sel = |end: &solidcraft_engine::sketch::BlendEnd| -> [Option<Sel>; 2] {
+            use solidcraft_engine::sketch::{BlendPlace, BlendTangent};
+            let at = match &end.at {
+                BlendPlace::Point(id) => Some(Sel::SketchPoint { id: id.clone() }),
+                BlendPlace::Curve(r) => Some(Sel::SketchCurve { id: r.split('.').next().unwrap_or(r).to_string(), sketch: Some(sk) }),
+                BlendPlace::Vertex { body, point } => Some(Sel::Vertex { body: body.clone(), point: *point }),
+                BlendPlace::World(v) => Some(Sel::Vertex { body: String::new(), point: *v }),
+            };
+            let tangent = match &end.tangent {
+                BlendTangent::Curve(id) => Some(Sel::SketchCurve { id: id.clone(), sketch: Some(sk) }),
+                BlendTangent::Edge { body, edge } => Some(Sel::Edge { body: body.clone(), index: *edge, point: Vec3::ZERO }),
+                BlendTangent::Handle(_) => None,
+            };
+            [at, tangent]
+        };
+        for (slot, end) in [(0, &b.a), (2, &b.b)] {
+            if let Some(input) = i.get_mut(slot) {
+                input.items.extend(sel(end)[0].clone());
+            }
+            if let Some(input) = i.get_mut(slot + 1) {
+                input.items.extend(sel(end)[1].clone());
+            }
+        }
+    }
     Some((Kind::SketchModify(k), i))
 }
 
@@ -480,15 +514,9 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Mod, doc: &Document) -> bool {
             });
         }
         Mod::Mirror => {}
-        // The two tensions sit beside their tangents, drawn by the dialog's input loop; the
-        // direction each tangent runs in is a toggle at the end.
-        Mod::Blend { a_tension, b_tension, a_flip, b_flip, editing, .. } => {
-            if editing.is_some() {
-                enter |= number(ui, "Tension 1", a_tension);
-                enter |= number(ui, "Tension 2", b_tension);
-            }
-            ui_kit::checkbox_grid(ui, &mut [("Flip tangent 1", a_flip), ("Flip tangent 2", b_flip)], 2);
-        }
+        // An edit has no picks, so its two joints are rows here: tension then direction, joint by
+        // joint. With picks, the dialog's input loop draws them beside each tangent instead.
+        Mod::Blend { .. } => {}
         Mod::Move { x, y, angle, copy } => {
             enter |= ui_kit::value_pair(ui, "Position", [x, y], ["X", "Y"], Some(["X Distance", "Y Distance"]));
             enter |= number(ui, "Angle", angle);
@@ -857,7 +885,8 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                 |i: usize, what: &str| -> Result<Sel, String> { items(inputs, i).first().cloned().ok_or_else(|| format!("Select the {what}")) };
             let point_of = |i: usize, what: &str| -> Result<Value, String> {
                 match picked(i, what)? {
-                    Sel::Vertex { point, .. } | Sel::Edge { point, .. } => Ok(json!({"at": pt(point)})),
+                    Sel::Vertex { body, point } => Ok(json!({"at": pt(point), "body": body})),
+                    Sel::Edge { point, .. } => Ok(json!({"at": pt(point)})),
                     // A sketch point is named, not given as coordinates: the engine knows the
                     // sketch's frame, this window does not.
                     Sel::SketchPoint { id, .. } => Ok(json!({"point": id})),
@@ -873,7 +902,7 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                     _ => Err(format!("Pick an edge or sketch curve for {what}")),
                 }
             };
-            let params = json!({
+            let mut params = json!({
                 "a_at": point_of(0, "Point or vertex 1")?,
                 "a_tangent": tangent_of(1, "Tangent 1")?,
                 "b_at": point_of(2, "Point or vertex 2")?,
@@ -883,6 +912,13 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                 "a_flip": a_flip,
                 "b_flip": b_flip,
             });
+            // Editing rebuilds the named curve rather than adding one, wherever it lives.
+            if let Some(id) = editing {
+                params["edit"] = json!(id);
+                if let Some(sketch) = target {
+                    params["sketch"] = json!(sketch);
+                }
+            }
             ("sketch.blend3d", params)
         }
         Mod::Mirror => {

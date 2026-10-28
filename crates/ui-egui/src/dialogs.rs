@@ -2353,17 +2353,25 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, r
     let mut activate: Option<usize> = None;
     let mut remove = None;
     let shell_count = d.shell_faces(s).map(|faces| faces.len());
-    // The blend asks six values in picking order, so its tensions belong beside their tangents
-    // rather than after all four picks. They are read here, written back below the loop.
+    // The blend asks its six values in picking order, so each joint's tension and direction
+    // toggle belong under its tangent rather than after all four picks. They are read here and
+    // written back below the loop. An edit has no picks: its rows come from `rows()` instead.
     let mut tensions: Option<[String; 2]> = match &d.kind {
         Kind::SketchModify(crate::sketch_modify_ui::Mod::Blend { a_tension, b_tension, .. }) => Some([a_tension.clone(), b_tension.clone()]),
         _ => None,
     };
+    let mut flips: Option<[bool; 2]> = match &d.kind {
+        Kind::SketchModify(crate::sketch_modify_ui::Mod::Blend { a_flip, b_flip, .. }) => Some([*a_flip, *b_flip]),
+        _ => None,
+    };
+    let joint_rows = tensions.is_some() && !d.inputs.is_empty();
     for (i, inp) in d.inputs.iter().enumerate().skip(range.start).take(range.end.saturating_sub(range.start)) {
-        if i == 2
-            && let Some([a_tension, _]) = &mut tensions
+        if joint_rows
+            && i == 2
+            && let (Some([a_tension, _]), Some([a_flip, _])) = (&mut tensions, &mut flips)
         {
             crate::sketch_modify_ui::number_row(ui, "Tension 1", a_tension);
+            crate::ui_kit::options(ui, "blend_dir_1", &mut [("Flip tangent 1", a_flip)]);
         }
         let stored_reference = feature_pattern_reference_key(d, i).and_then(|key| d.extra.get(key)).filter(|_| inp.items.is_empty());
         form_row(ui, inp.label, |ui| {
@@ -2439,14 +2447,17 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, r
             }
         }
     }
-    if let Some([_, b_tension]) = &mut tensions {
+    if joint_rows && let (Some([_, b_tension]), Some([_, b_flip])) = (&mut tensions, &mut flips) {
         crate::sketch_modify_ui::number_row(ui, "Tension 2", b_tension);
+        crate::ui_kit::options(ui, "blend_dir_2", &mut [("Flip tangent 2", b_flip)]);
     }
-    if let Some([a, b]) = tensions
-        && let Kind::SketchModify(crate::sketch_modify_ui::Mod::Blend { a_tension, b_tension, .. }) = &mut d.kind
+    if let (Some([a, b]), Some([fa, fb])) = (tensions, flips)
+        && let Kind::SketchModify(crate::sketch_modify_ui::Mod::Blend { a_tension, b_tension, a_flip, b_flip, .. }) = &mut d.kind
     {
         *a_tension = a;
         *b_tension = b;
+        *a_flip = fa;
+        *b_flip = fb;
     }
     if let Some((input, index)) = remove
         && let Some(input) = d.inputs.get_mut(input)

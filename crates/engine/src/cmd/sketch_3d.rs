@@ -352,6 +352,7 @@ fn stored_end(
             let q = sk.point(i).ok_or_else(|| bad(cmd, format!("no sketch point `{id}`")))?;
             Vec3::new(q.x, q.y, 0.0)
         }
+        BlendPlace::Vertex { point, .. } => *point,
         BlendPlace::World(v) => *v,
     };
     let reference = match &end.tangent {
@@ -374,17 +375,20 @@ fn unit(v: Vec3) -> Option<Vec3> {
 fn joint_param(p: &Value, k: &str, cmd: &str) -> Result<JointInput> {
     let v = p.get(k).ok_or_else(|| bad(cmd, format!("`{k}` is missing: give a point or vertex")))?;
     if let Some(at) = vec3(v) {
-        return Ok(JointInput::At(at));
+        return Ok(JointInput::At(at, None));
     }
     if let Some(id) = v.get("point").and_then(Value::as_str) {
         return Ok(JointInput::Point(id.to_string()));
     }
-    v.get("at").and_then(vec3).map(JointInput::At).ok_or_else(|| bad(cmd, format!("`{k}` must be [x,y,z], {{at: [x,y,z]}} or {{point: id}}")))
+    v.get("at")
+        .and_then(vec3)
+        .map(|at| JointInput::At(at, v.get("body").and_then(Value::as_str).map(str::to_string)))
+        .ok_or_else(|| bad(cmd, format!("`{k}` must be [x,y,z], {{at: [x,y,z]}} or {{point: id}}")))
 }
 
 /// A joint as the caller gave it: either a place or the id of a sketch point.
 enum JointInput {
-    At(Vec3),
+    At(Vec3, Option<String>),
     Point(String),
 }
 
@@ -425,8 +429,8 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
     // Either name the two ends, or give the two world points the user clicked.
     let ra = p.get("a").and_then(Value::as_str).map(str::to_string);
     let rb = p.get("b").and_then(Value::as_str).map(str::to_string);
-    let pa_at = if edit_id.is_none() && ra.is_none() { Some(joint_param(p, "a_at", cmd)?) } else { None };
-    let pb_at = if edit_id.is_none() && rb.is_none() { Some(joint_param(p, "b_at", cmd)?) } else { None };
+    let pa_at = if ra.is_none() && p.get("a_at").is_some() { Some(joint_param(p, "a_at", cmd)?) } else { None };
+    let pb_at = if rb.is_none() && p.get("b_at").is_some() { Some(joint_param(p, "b_at", cmd)?) } else { None };
     // The tangent at each joint is its own pick — the specific edge the user chose, since a
     // corner can have several. Without one the curve at the joint supplies its own direction.
     let ta_ref = p.get("a_tangent").filter(|v| !v.is_null()).cloned();
@@ -439,14 +443,14 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
     let clicks: Vec<Vec3> = [&pa_at, &pb_at]
         .into_iter()
         .filter_map(|j| match j {
-            Some(JointInput::At(at)) => Some(*at),
+            Some(JointInput::At(at, _)) => Some(*at),
             _ => None,
         })
         .collect();
     let model_hits = nearest_model_ends(&state, &clicks);
     let model_of = |at: &Option<JointInput>| -> Option<(Vec3, Vec3)> {
         let at = match at {
-            Some(JointInput::At(at)) => *at,
+            Some(JointInput::At(at, _)) => *at,
             _ => return None,
         };
         let i = clicks.iter().position(|c| c.dist(at) < 1e-12)?;
@@ -456,62 +460,6 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
     let (id, info) = edit(s, p, cmd, false, |sk, _| {
         needs_3d(sk, cmd)?;
         let ends = sketch_ends(sk);
-        if let Some(id) = &edit_id {
-            use solidcraft_sketch::{Blend, BlendEnd};
-            let stored = sk
-                .wire_index(id)
-                .and_then(|i| sk.wires.get(i))
-                .map(|w| (w.blend.clone(), w.bezier.clone()))
-                .ok_or_else(|| bad(cmd, format!("no curve `{id}`")))?;
-            // A blend made before its inputs were recorded still has its control polygon: its
-            // handles give the joints and directions, so its tension stays editable.
-            let fallback = |control: &[Vec3]| -> Option<solidcraft_sketch::Blend> {
-                let n = control.len();
-                if n < 2 {
-                    return None;
-                }
-                let end = |at: Vec3, dir: Vec3| solidcraft_sketch::BlendEnd {
-                    at: solidcraft_sketch::BlendPlace::World(at),
-                    tangent: solidcraft_sketch::BlendTangent::Handle(dir),
-                    tension: 1.0,
-                    flip: false,
-                };
-                let (a, b) = (control[0], control[n - 1]);
-                Some(solidcraft_sketch::Blend {
-                    a: end(a, unit(control[1] - a).unwrap_or(Vec3::ZERO)),
-                    b: end(b, unit(control[n - 2] - b).unwrap_or(Vec3::ZERO)),
-                    continuity: if n == 2 { 0 } else { 1 },
-                })
-            };
-            let stored = match stored {
-                (Some(b), _) => b,
-                (None, Some(control)) => fallback(&control).ok_or_else(|| bad(cmd, format!("`{id}` is not a blend curve")))?,
-                (None, None) => return Err(bad(cmd, format!("`{id}` is not a blend curve"))),
-            };
-            let spec = Blend {
-                a: BlendEnd { tension: ta, flip: fa.unwrap_or(stored.a.flip), ..stored.a },
-                b: BlendEnd { tension: tb, flip: fb.unwrap_or(stored.b.flip), ..stored.b },
-                continuity: stored.continuity,
-            };
-            let (pa, dir_a) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.a, cmd)?;
-            let (pb, dir_b) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.b, cmd)?;
-            let l = pa.dist(pb);
-            if l < 1e-9 {
-                return Err(bad(cmd, "the two ends must differ"));
-            }
-            let span = pb - pa;
-            let orient = |d: Vec3| if d.dot(span) < 0.0 { d * -1.0 } else { d };
-            let control: Vec<Vec3> = if spec.continuity == 0 {
-                vec![pa, pb]
-            } else {
-                let turn = |d: Vec3, flip: bool| if flip { d * -1.0 } else { d };
-                let d0 = turn(orient(dir_a), spec.a.flip) * (l / 3.0 * spec.a.tension);
-                let d1 = turn(orient(dir_b), spec.b.flip) * (l / 3.0 * spec.b.tension);
-                solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1]).ok_or_else(|| bad(cmd, "the blend curve could not be rebuilt"))?
-            };
-            sk.set_blend(id, &control, spec)?;
-            return Ok(id.clone());
-        }
         // A click may land on a sketch curve or on an edge of the model. Whichever end is nearer
         // to the click wins; both are compared in the sketch's own coordinates.
         let pick = |at: Vec3, model: Option<(Vec3, Vec3)>| -> Result<(Vec3, Vec3)> {
@@ -537,44 +485,15 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
                     // A named point carries no direction of its own; its tangent is the pick.
                     Ok((Vec3::new(q.x, q.y, 0.0), Vec3::ZERO))
                 }
-                (None, Some(JointInput::At(at))) => pick(*at, model),
+                (None, Some(JointInput::At(at, _))) => pick(*at, model),
                 (None, None) => Err(bad(cmd, "give `a` and `b`, or `a_at` and `b_at`")),
             }
         };
-        let (pa, in_a) = resolve(&ra, &pa_at, ma)?;
-        let (pb, in_b) = resolve(&rb, &pb_at, mb)?;
-        let l = pa.dist(pb);
-        if l < 1e-9 {
-            return Err(bad(cmd, "the two ends must differ"));
-        }
-        let control: Vec<Vec3> = if cont == "g0" {
-            vec![pa, pb]
-        } else {
-            // A picked tangent wins; otherwise the curve runs on out of `a` and into `b`. Either
-            // way it is oriented to leave one joint and reach the other, and scaled by the span
-            // and the joint's tension.
-            let span = pb - pa;
-            let orient = |d: Vec3| if d.dot(span) < 0.0 { d * -1.0 } else { d };
-            let fallback = |into: Vec3, leaving: bool| if leaving { into * -1.0 } else { into };
-            let dir_a = match &ta_ref {
-                Some(r) => referenced_tangent(sk, &state, &inverse, &forward, r, pa, cmd)?,
-                None => unit(fallback(in_a, true)).ok_or_else(|| bad(cmd, "the first joint has no tangent: pick an edge or curve for it"))?,
-            };
-            let dir_b = match &tb_ref {
-                Some(r) => referenced_tangent(sk, &state, &inverse, &forward, r, pb, cmd)?,
-                None => unit(fallback(in_b, false)).ok_or_else(|| bad(cmd, "the second joint has no tangent: pick an edge or curve for it"))?,
-            };
-            let (fa, fb) = (fa.unwrap_or(false), fb.unwrap_or(false));
-            let turn = |d: Vec3, flip: bool| if flip { d * -1.0 } else { d };
-            let (d0, d1) = (turn(orient(dir_a), fa) * (l / 3.0 * ta), turn(orient(dir_b), fb) * (l / 3.0 * tb));
-            solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1])
-                .ok_or_else(|| bad(cmd, "the blend curve could not be built from the tangents at both ends"))?
-        };
-        // Record what built it, so the tension can be changed later without picking again.
         use solidcraft_sketch::{Blend, BlendEnd, BlendPlace, BlendTangent};
         let place = |r: &Option<String>, at: &Option<JointInput>, p: Vec3| match (r, at) {
             (Some(r), _) => BlendPlace::Curve(r.clone()),
             (None, Some(JointInput::Point(id))) => BlendPlace::Point(id.clone()),
+            (None, Some(JointInput::At(_, Some(body)))) => BlendPlace::Vertex { body: body.clone(), point: p },
             _ => BlendPlace::World(p),
         };
         // A joint named by a curve end needs no tangent pick: that curve is its tangent.
@@ -597,15 +516,93 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
                 },
             }
         };
-        let (at_a, at_b) = (place(&ra, &pa_at, pa), place(&rb, &pb_at, pb));
-        let spec = Blend {
-            a: BlendEnd { at: at_a.clone(), tangent: tangent(&ta_ref, &at_a)?, tension: ta, flip: fa.unwrap_or(false) },
-            b: BlendEnd { at: at_b.clone(), tangent: tangent(&tb_ref, &at_b)?, tension: tb, flip: fb.unwrap_or(false) },
-            continuity: if cont == "g0" { 0 } else { 1 },
+        // The joints come from this run's picks when it has any; an edit that only changes the
+        // tensions and directions reuses the joints and tangents the curve recorded.
+        let picked = pa_at.is_some() || pb_at.is_some();
+        let (spec, pa, pb, dir_a, dir_b) = if picked || edit_id.is_none() {
+            let (pa, in_a) = resolve(&ra, &pa_at, ma)?;
+            let (pb, in_b) = resolve(&rb, &pb_at, mb)?;
+            let (at_a, at_b) = (place(&ra, &pa_at, pa), place(&rb, &pb_at, pb));
+            let (tan_a, tan_b) = (tangent(&ta_ref, &at_a)?, tangent(&tb_ref, &at_b)?);
+            let dir = |r: &Option<Value>, at: Vec3, fallback: Vec3| -> Result<Vec3> {
+                match r {
+                    Some(r) => referenced_tangent(sk, &state, &inverse, &forward, r, at, cmd),
+                    None => unit(fallback).ok_or_else(|| bad(cmd, "the joint has no tangent: pick an edge or curve for it")),
+                }
+            };
+            let dir_a = dir(&ta_ref, pa, in_a * -1.0)?;
+            let dir_b = dir(&tb_ref, pb, in_b)?;
+            let spec = Blend {
+                a: BlendEnd { at: at_a, tangent: tan_a, tension: ta, flip: fa.unwrap_or(false) },
+                b: BlendEnd { at: at_b, tangent: tan_b, tension: tb, flip: fb.unwrap_or(false) },
+                continuity: if cont == "g0" { 0 } else { 1 },
+            };
+            (spec, pa, pb, dir_a, dir_b)
+        } else {
+            let id = edit_id.clone().unwrap_or_default();
+            let stored = sk
+                .wire_index(&id)
+                .and_then(|i| sk.wires.get(i))
+                .map(|w| (w.blend.clone(), w.bezier.clone()))
+                .ok_or_else(|| bad(cmd, format!("no curve `{id}`")))?;
+            // A blend made before its inputs were recorded still has its control polygon: its
+            // handles give the joints and directions, so it stays editable.
+            let spec = match stored {
+                (Some(b), _) => b,
+                (None, Some(control)) => {
+                    let n = control.len();
+                    if n < 2 {
+                        return Err(bad(cmd, format!("`{id}` is not a blend curve")));
+                    }
+                    let end =
+                        |at: Vec3, dir: Vec3| BlendEnd { at: BlendPlace::World(at), tangent: BlendTangent::Handle(dir), tension: 1.0, flip: false };
+                    let (a, b) = (control[0], control[n - 1]);
+                    Blend {
+                        a: end(a, unit(control[1] - a).unwrap_or(Vec3::ZERO)),
+                        b: end(b, unit(control[n - 2] - b).unwrap_or(Vec3::ZERO)),
+                        continuity: if n == 2 { 0 } else { 1 },
+                    }
+                }
+                (None, None) => return Err(bad(cmd, format!("`{id}` is not a blend curve"))),
+            };
+            let spec = Blend {
+                a: BlendEnd { tension: ta, flip: fa.unwrap_or(spec.a.flip), ..spec.a },
+                b: BlendEnd { tension: tb, flip: fb.unwrap_or(spec.b.flip), ..spec.b },
+                continuity: spec.continuity,
+            };
+            let (pa, dir_a) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.a, cmd)?;
+            let (pb, dir_b) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.b, cmd)?;
+            (spec, pa, pb, dir_a, dir_b)
         };
-        let id = sk.add_drawn_bezier_in(&control, WireSpace::Component)?;
-        sk.set_blend(&id, &control, spec)?;
-        Ok(id)
+        let l = pa.dist(pb);
+        if l < 1e-9 {
+            return Err(bad(cmd, "the two ends must differ"));
+        }
+        let control: Vec<Vec3> = if spec.continuity == 0 {
+            vec![pa, pb]
+        } else {
+            // A picked tangent wins; otherwise the curve runs on out of `a` and into `b`. Either
+            // way it is oriented to leave one joint and reach the other, then scaled by the span,
+            // the joint's tension, and the direction its toggle asks for.
+            let span = pb - pa;
+            let orient = |d: Vec3| if d.dot(span) < 0.0 { d * -1.0 } else { d };
+            let turn = |d: Vec3, flip: bool| if flip { d * -1.0 } else { d };
+            let (d0, d1) =
+                (turn(orient(dir_a), spec.a.flip) * (l / 3.0 * spec.a.tension), turn(orient(dir_b), spec.b.flip) * (l / 3.0 * spec.b.tension));
+            solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1])
+                .ok_or_else(|| bad(cmd, "the blend curve could not be built from the tangents at both ends"))?
+        };
+        match &edit_id {
+            Some(id) => {
+                sk.set_blend(id, &control, spec)?;
+                Ok(id.clone())
+            }
+            None => {
+                let id = sk.add_drawn_bezier_in(&control, WireSpace::Component)?;
+                sk.set_blend(&id, &control, spec)?;
+                Ok(id)
+            }
+        }
     })?;
     Ok(json!({ "curves": [id], "sketch": info }))
 }
