@@ -271,6 +271,12 @@ fn referenced_tangent(
     cmd: &str,
 ) -> Result<Vec3> {
     if let Some(id) = reference.as_str() {
+        // A 3D drawn curve is a wire, not a 2D curve: it is measured from its own samples.
+        if let Some(w) = sk.wires.iter().find(|w| w.id == id) {
+            return nearest_segment_dir(&w.pts, joint)
+                .and_then(|(_, dir)| unit(dir))
+                .ok_or_else(|| bad(cmd, format!("`{id}` has no direction at the joint")));
+        }
         let ci = sk.curve_index(id).ok_or_else(|| bad(cmd, format!("no sketch curve `{id}` to take the tangent from")))?;
         let poly: Vec<Vec3> = sk.polyline(ci).into_iter().map(|q| Vec3::new(q.x, q.y, 0.0)).collect();
         return nearest_segment_dir(&poly, joint)
@@ -289,6 +295,47 @@ fn referenced_tangent(
     nearest_segment_dir(e, solidcraft_doc::apply_point(forward, joint))
         .and_then(|(_, dir)| unit(solidcraft_doc::apply_vector(inverse, dir)))
         .ok_or_else(|| bad(cmd, format!("edge {edge} of `{body}` has no direction at the joint")))
+}
+
+/// Where a stored blend end joins, and the direction its picked edge supplies there.
+///
+/// Args:
+///     sk: The sketch being edited.
+///     st: The model as it stood before the sketch.
+///     inverse: World-to-sketch transform.
+///     forward: Sketch-to-world transform.
+///     ends: The sketch's ends, as returned by [`sketch_ends`].
+///     end: One stored end of a blend.
+///     cmd: The command id, for error messages.
+///
+/// Returns:
+///     The joint position and the tangent direction, both in the sketch's coordinates.
+fn stored_end(
+    sk: &solidcraft_sketch::Sketch,
+    st: &solidcraft_doc::ModelState,
+    inverse: &solidcraft_doc::Mat,
+    forward: &solidcraft_doc::Mat,
+    ends: &[(String, Vec3, Vec3)],
+    end: &solidcraft_sketch::BlendEnd,
+    cmd: &str,
+) -> Result<(Vec3, Vec3)> {
+    use solidcraft_sketch::{BlendPlace, BlendTangent};
+    let at = match &end.at {
+        BlendPlace::Curve(r) => named_end(ends, r, cmd)?.0,
+        BlendPlace::Point(id) => {
+            let i = sk.point_index(id).ok_or_else(|| bad(cmd, format!("no sketch point `{id}`")))?;
+            let q = sk.point(i).ok_or_else(|| bad(cmd, format!("no sketch point `{id}`")))?;
+            Vec3::new(q.x, q.y, 0.0)
+        }
+        BlendPlace::World(v) => *v,
+    };
+    let reference = match &end.tangent {
+        BlendTangent::Curve(id) => Value::String(id.clone()),
+        BlendTangent::Edge { body, edge } => json!({"body": body, "edge": edge}),
+        BlendTangent::Handle(dir) => return Ok((at, *dir)),
+    };
+    let dir = referenced_tangent(sk, st, inverse, forward, &reference, at, cmd)?;
+    Ok((at, dir))
 }
 
 /// Unit vector, or `None` when `v` is too short to have a direction.
@@ -331,6 +378,9 @@ enum JointInput {
 ///     `{curves: [id], sketch: …}` with the blend's id.
 fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.blend3d";
+    // Editing an existing blend: its joints and tangents are already recorded, so only the
+    // tension changes are read from the parameters.
+    let edit_id = p.get("edit").and_then(Value::as_str).map(str::to_string);
     let cont = p.get("continuity").and_then(Value::as_str).unwrap_or("g1").to_ascii_lowercase();
     if !matches!(cont.as_str(), "g0" | "g1") {
         return Err(bad(cmd, format!("continuity `{cont}` is not supported: a drawn 3D curve stores no curvature, so only g0 and g1 can be met")));
@@ -347,8 +397,8 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
     // Either name the two ends, or give the two world points the user clicked.
     let ra = p.get("a").and_then(Value::as_str).map(str::to_string);
     let rb = p.get("b").and_then(Value::as_str).map(str::to_string);
-    let pa_at = if ra.is_none() { Some(joint_param(p, "a_at", cmd)?) } else { None };
-    let pb_at = if rb.is_none() { Some(joint_param(p, "b_at", cmd)?) } else { None };
+    let pa_at = if edit_id.is_none() && ra.is_none() { Some(joint_param(p, "a_at", cmd)?) } else { None };
+    let pb_at = if edit_id.is_none() && rb.is_none() { Some(joint_param(p, "b_at", cmd)?) } else { None };
     // The tangent at each joint is its own pick — the specific edge the user chose, since a
     // corner can have several. Without one the curve at the joint supplies its own direction.
     let ta_ref = p.get("a_tangent").filter(|v| !v.is_null()).cloned();
@@ -378,6 +428,56 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
     let (id, info) = edit(s, p, cmd, false, |sk, _| {
         needs_3d(sk, cmd)?;
         let ends = sketch_ends(sk);
+        if let Some(id) = &edit_id {
+            use solidcraft_sketch::{Blend, BlendEnd};
+            let stored = sk
+                .wire_index(id)
+                .and_then(|i| sk.wires.get(i))
+                .map(|w| (w.blend.clone(), w.bezier.clone()))
+                .ok_or_else(|| bad(cmd, format!("no curve `{id}`")))?;
+            // A blend made before its inputs were recorded still has its control polygon: its
+            // handles give the joints and directions, so its tension stays editable.
+            let fallback = |control: &[Vec3]| -> Option<solidcraft_sketch::Blend> {
+                let n = control.len();
+                if n < 2 {
+                    return None;
+                }
+                let end = |at: Vec3, dir: Vec3| solidcraft_sketch::BlendEnd {
+                    at: solidcraft_sketch::BlendPlace::World(at),
+                    tangent: solidcraft_sketch::BlendTangent::Handle(dir),
+                    tension: 1.0,
+                };
+                let (a, b) = (control[0], control[n - 1]);
+                Some(solidcraft_sketch::Blend {
+                    a: end(a, unit(control[1] - a).unwrap_or(Vec3::ZERO)),
+                    b: end(b, unit(control[n - 2] - b).unwrap_or(Vec3::ZERO)),
+                    continuity: if n == 2 { 0 } else { 1 },
+                })
+            };
+            let stored = match stored {
+                (Some(b), _) => b,
+                (None, Some(control)) => fallback(&control).ok_or_else(|| bad(cmd, format!("`{id}` is not a blend curve")))?,
+                (None, None) => return Err(bad(cmd, format!("`{id}` is not a blend curve"))),
+            };
+            let spec = Blend { a: BlendEnd { tension: ta, ..stored.a }, b: BlendEnd { tension: tb, ..stored.b }, continuity: stored.continuity };
+            let (pa, dir_a) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.a, cmd)?;
+            let (pb, dir_b) = stored_end(sk, &state, &inverse, &forward, &ends, &spec.b, cmd)?;
+            let l = pa.dist(pb);
+            if l < 1e-9 {
+                return Err(bad(cmd, "the two ends must differ"));
+            }
+            let span = pb - pa;
+            let orient = |d: Vec3| if d.dot(span) < 0.0 { d * -1.0 } else { d };
+            let control: Vec<Vec3> = if spec.continuity == 0 {
+                vec![pa, pb]
+            } else {
+                let d0 = orient(dir_a) * (l / 3.0 * spec.a.tension);
+                let d1 = orient(dir_b) * (l / 3.0 * spec.b.tension);
+                solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1]).ok_or_else(|| bad(cmd, "the blend curve could not be rebuilt"))?
+            };
+            sk.set_blend(id, &control, spec)?;
+            return Ok(id.clone());
+        }
         // A click may land on a sketch curve or on an edge of the model. Whichever end is nearer
         // to the click wins; both are compared in the sketch's own coordinates.
         let pick = |at: Vec3, model: Option<(Vec3, Vec3)>| -> Result<(Vec3, Vec3)> {
@@ -434,7 +534,42 @@ fn blend3d(s: &mut Session, p: &Value) -> Result<Value> {
             solidcraft_geom::hermite_bezier3(pa, pb, &[d0], &[d1])
                 .ok_or_else(|| bad(cmd, "the blend curve could not be built from the tangents at both ends"))?
         };
-        Ok(sk.add_drawn_bezier_in(&control, WireSpace::Component)?)
+        // Record what built it, so the tension can be changed later without picking again.
+        use solidcraft_sketch::{Blend, BlendEnd, BlendPlace, BlendTangent};
+        let place = |r: &Option<String>, at: &Option<JointInput>, p: Vec3| match (r, at) {
+            (Some(r), _) => BlendPlace::Curve(r.clone()),
+            (None, Some(JointInput::Point(id))) => BlendPlace::Point(id.clone()),
+            _ => BlendPlace::World(p),
+        };
+        // A joint named by a curve end needs no tangent pick: that curve is its tangent.
+        let tangent = |r: &Option<Value>, place: &BlendPlace| -> Result<BlendTangent> {
+            match r {
+                Some(Value::String(id)) => Ok(BlendTangent::Curve(id.clone())),
+                Some(v) => {
+                    let body =
+                        v.get("body").and_then(Value::as_str).ok_or_else(|| bad(cmd, "a tangent must be a sketch curve id or {body, edge}"))?;
+                    let edge = v
+                        .get("edge")
+                        .and_then(Value::as_u64)
+                        .and_then(|e| usize::try_from(e).ok())
+                        .ok_or_else(|| bad(cmd, "`edge` must be an edge index"))?;
+                    Ok(BlendTangent::Edge { body: body.to_string(), edge })
+                }
+                None => match place {
+                    BlendPlace::Curve(reference) => Ok(BlendTangent::Curve(reference.split('.').next().unwrap_or(reference).to_string())),
+                    _ => Err(bad(cmd, "a joint given by a point needs the edge that sets its tangent")),
+                },
+            }
+        };
+        let (at_a, at_b) = (place(&ra, &pa_at, pa), place(&rb, &pb_at, pb));
+        let spec = Blend {
+            a: BlendEnd { at: at_a.clone(), tangent: tangent(&ta_ref, &at_a)?, tension: ta },
+            b: BlendEnd { at: at_b.clone(), tangent: tangent(&tb_ref, &at_b)?, tension: tb },
+            continuity: if cont == "g0" { 0 } else { 1 },
+        };
+        let id = sk.add_drawn_bezier_in(&control, WireSpace::Component)?;
+        sk.set_blend(&id, &control, spec)?;
+        Ok(id)
     })?;
     Ok(json!({ "curves": [id], "sketch": info }))
 }

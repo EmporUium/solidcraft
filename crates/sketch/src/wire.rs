@@ -66,10 +66,53 @@ pub struct Wire {
     /// controls are not fit points, so they are not drawn or picked as sketch points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bezier: Option<Vec<Vec3>>,
+    /// A blend curve's inputs, so its tension can be edited without picking it all again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blend: Option<Blend>,
 }
 
 /// Most fit points of a drawn 3D curve.
 pub const MAX_FIT_POINTS: usize = 500;
+
+/// One end of a blend: the place it joins, the edge that set its tangent, and its tension.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BlendEnd {
+    pub at: BlendPlace,
+    pub tangent: BlendTangent,
+    pub tension: f64,
+}
+
+/// Where a blend joins: a curve end, a sketch point, or a fixed place.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum BlendPlace {
+    /// A curve end such as `w1.end` or `l4.start`.
+    Curve(String),
+    /// A sketch point by id.
+    Point(String),
+    /// A point with no sketch reference behind it.
+    World(Vec3),
+}
+
+/// What set a blend's tangent at one end.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum BlendTangent {
+    /// A sketch curve by id.
+    Curve(String),
+    /// An edge of a body.
+    Edge { body: String, edge: usize },
+    /// A direction taken from the curve's own handle, for a blend whose edges were not recorded.
+    Handle(Vec3),
+}
+
+/// The inputs a blend curve was built from, kept with it so its tension can be changed later
+/// without picking the joints and tangents again.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Blend {
+    pub a: BlendEnd,
+    pub b: BlendEnd,
+    /// `0` for G0, `1` for G1: the continuity order the curve was built to.
+    pub continuity: u8,
+}
 
 /// Samples per span of a drawn 3D spline.
 const SPAN_SAMPLES: usize = 24;
@@ -345,7 +388,16 @@ impl Sketch {
                 Some(o) => o.clone(),
                 None => self.fresh("w")?,
             };
-            self.wires.push(Wire { id: wid, pts, space: WireSpace::Component, link: Some(id.to_string()), fit: Vec::new(), arc: None, bezier: None });
+            self.wires.push(Wire {
+                id: wid,
+                pts,
+                space: WireSpace::Component,
+                link: Some(id.to_string()),
+                fit: Vec::new(),
+                arc: None,
+                bezier: None,
+                blend: None,
+            });
         }
         Ok(())
     }
@@ -360,7 +412,7 @@ impl Sketch {
         let pts = drawn_polyline(fit)?;
         self.wire_budget(None, 1, pts.len() + fit.len())?;
         let id = self.fresh(if fit.len() == 1 { "q" } else { "w" })?;
-        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: None, bezier: None });
+        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: None, bezier: None, blend: None });
         Ok(id)
     }
 
@@ -381,8 +433,27 @@ impl Sketch {
         let fit = vec![control[0], control[control.len() - 1]];
         self.wire_budget(None, 1, clean.len() + control.len())?;
         let id = self.fresh("w")?;
-        self.wires.push(Wire { id: id.clone(), pts: clean, space, link: None, fit, arc: None, bezier: Some(control.to_vec()) });
+        self.wires.push(Wire { id: id.clone(), pts: clean, space, link: None, fit, arc: None, bezier: Some(control.to_vec()), blend: None });
         Ok(id)
+    }
+
+    /// Set a blend curve's geometry and its inputs, replacing both on an existing wire.
+    ///
+    /// Args:
+    ///     id: The blend's wire id.
+    ///     control: Its new Bézier control polygon, in the wire's own space.
+    ///     blend: The inputs the polygon was built from.
+    ///
+    /// Returns:
+    ///     `Ok(())` once the samples and both records are in place.
+    pub fn set_blend(&mut self, id: &str, control: &[Vec3], blend: Blend) -> Result<()> {
+        let pts = bezier_polyline(control)?;
+        let w = self.wire_index(id).and_then(|i| self.wires.get_mut(i)).ok_or_else(|| SketchError::Unknown(id.into()))?;
+        w.pts = pts;
+        w.fit = vec![control[0], control[control.len() - 1]];
+        w.bezier = Some(control.to_vec());
+        w.blend = Some(blend);
+        Ok(())
     }
 
     /// Add an exact circular arc drawn in a 3D sketch: `fit` is its three defining points
@@ -401,7 +472,7 @@ impl Sketch {
         let pts = arc_polyline(&arc, ARC_TOL);
         self.wire_budget(None, 1, pts.len() + fit.len())?;
         let id = self.fresh("w")?;
-        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: Some(arc), bezier: None });
+        self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec(), arc: Some(arc), bezier: None, blend: None });
         Ok(id)
     }
 

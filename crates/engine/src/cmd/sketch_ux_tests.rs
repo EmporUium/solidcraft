@@ -1466,6 +1466,32 @@ fn blend3d_tension_scales_each_handle() {
 }
 
 #[test]
+fn blend3d_edit_rebuilds_from_the_recorded_inputs() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.options", json!({"sketch_3d": true}));
+    let a = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[0, 0, 0], [50, 0, 0]]})));
+    let b = curve_ids(&run(&mut s, "sketch.line3d", json!({"points": [[100, 20, 0], [150, 20, 0]]})));
+    let blend = curve_ids(&run(&mut s, "sketch.blend3d", json!({"a": format!("{}.end", a[0]), "b": format!("{}.start", b[0])})))[0].clone();
+    let controls = |s: &Session| {
+        let sk = sketch(s);
+        sk.wires[sk.wire_index(&blend).expect("the blend")].bezier.clone().expect("controls")
+    };
+    let before = controls(&s);
+    // Editing by id alone changes nothing but keeps the same wire.
+    let r = run(&mut s, "sketch.blend3d", json!({"edit": blend}));
+    assert_eq!(curve_ids(&r)[0], blend);
+    assert_eq!(controls(&s), before, "no tension given leaves the curve as it was");
+    // A new tension is applied to the recorded joint, and only that handle changes.
+    run(&mut s, "sketch.blend3d", json!({"edit": blend, "a_tension": 2.0}));
+    let after = controls(&s);
+    assert!(((after[1] - after[0]).len() / (before[1] - before[0]).len() - 2.0).abs() < 1e-9);
+    assert!((after[3] - after[2]).dist(before[3] - before[2]) < 1e-9, "the other handle is untouched");
+    assert!(sketch(&s).wires[sketch(&s).wire_index(&blend).expect("the blend")].blend.is_some());
+    // A plain curve is not a blend.
+    assert!(s.execute("sketch.blend3d", &json!({"edit": a[0]})).is_err());
+}
+
+#[test]
 fn pipe_and_sweep_follow_3d_sketch_curves() {
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Path"}));

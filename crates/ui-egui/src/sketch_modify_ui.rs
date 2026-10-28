@@ -134,7 +134,7 @@ pub enum Mod {
     /// `sketch.blend3d`: two joints joined by one curve. Each joint is a point or vertex, the
     /// edge whose direction it leaves or enters, and the tension on that handle. Six values in
     /// all, picked left to right in that order.
-    Blend { a_tension: String, b_tension: String },
+    Blend { a_tension: String, b_tension: String, editing: Option<String> },
 }
 
 impl Mod {
@@ -199,12 +199,16 @@ fn inputs(k: &Mod) -> Vec<SelInput> {
         Mod::Corner { chamfer: false, .. } => vec![SelInput::new("Corners", SKETCH_POINTS | CURVES, true)],
         Mod::Corner { .. } => vec![SelInput::new("Corner", SKETCH_POINTS | CURVES, true)],
         // Point, then the edge that sets its tangent, twice: a corner can have several edges, so
-        // the tangent is always named rather than guessed.
+        // the tangent is always named rather than guessed. Each input takes one pick, so the
+        // dialog walks them in order and the next click fills the next field.
+        // Editing an existing blend: its joints and tangents are recorded, so the window only
+        // asks for the two tensions.
+        Mod::Blend { editing: Some(_), .. } => vec![],
         Mod::Blend { .. } => vec![
-            SelInput::new("Point or vertex 1", VERTICES | SKETCH_POINTS | CURVES, true),
-            SelInput::new("Tangent 1", EDGES | CURVES, true),
-            SelInput::new("Point or vertex 2", VERTICES | SKETCH_POINTS | CURVES, true),
-            SelInput::new("Tangent 2", EDGES | CURVES, true),
+            SelInput::new("Point or vertex 1", VERTICES | SKETCH_POINTS | CURVES, false),
+            SelInput::new("Tangent 1", EDGES | CURVES, false),
+            SelInput::new("Point or vertex 2", VERTICES | SKETCH_POINTS | CURVES, false),
+            SelInput::new("Tangent 2", EDGES | CURVES, false),
         ],
     }
 }
@@ -242,7 +246,21 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
             angle: "0 deg".into(),
             copy: false,
         },
-        "sketch.blend3d" => Mod::Blend { a_tension: "1".into(), b_tension: "1".into() },
+        "sketch.blend3d" => {
+            // A selected blend curve opens for editing: its inputs are already recorded.
+            let editing = app.session.active_sketch.and_then(|s| app.session.doc.sketch(s).ok()).and_then(|sk| {
+                app.session.selection.iter().find_map(|sel| match sel {
+                    Sel::SketchCurve { id, .. } => sk.wires.iter().find(|w| &w.id == id && w.bezier.is_some()).map(|w| (id.clone(), w.blend.clone())),
+                    _ => None,
+                })
+            });
+            match editing {
+                Some((id, Some(b))) => Mod::Blend { a_tension: format!("{}", b.a.tension), b_tension: format!("{}", b.b.tension), editing: Some(id) },
+                // A blend from before its inputs were recorded edits from its handles alone.
+                Some((id, None)) => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: Some(id) },
+                _ => Mod::Blend { a_tension: "1".into(), b_tension: "1".into(), editing: None },
+            }
+        }
         "sketch.pattern.rectangular" => Mod::PatternRect {
             count: "3".into(),
             spacing: crate::dialogs::length_default(&app.session, "20"),
@@ -382,6 +400,11 @@ pub(crate) fn repeatable(k: &Mod) -> bool {
 }
 
 /// A labelled value row. The value carries its own unit text ("2 mm", "45 deg").
+/// A numeric row in the dialog, for callers outside this module.
+pub(crate) fn number_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
+    number(ui, label, value)
+}
+
 fn number(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     ui_kit::row(ui, label, |ui| ui_kit::field(ui, value))
 }
@@ -446,10 +469,13 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Mod, doc: &Document) -> bool {
             });
         }
         Mod::Mirror => {}
-        Mod::Blend { a_tension, b_tension } => {
+        // The two tensions sit beside their tangents, drawn by the dialog's input loop; only the
+        // edit window, which has no picks, shows them here.
+        Mod::Blend { editing: Some(_), a_tension, b_tension } => {
             enter |= number(ui, "Tension 1", a_tension);
             enter |= number(ui, "Tension 2", b_tension);
         }
+        Mod::Blend { .. } => {}
         Mod::Move { x, y, angle, copy } => {
             enter |= ui_kit::value_pair(ui, "Position", [x, y], ["X", "Y"], Some(["X Distance", "Y Distance"]));
             enter |= number(ui, "Angle", angle);
@@ -802,7 +828,13 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             }
             ("sketch.offset", params)
         }
-        Mod::Blend { a_tension, b_tension } => {
+        Mod::Blend { a_tension, b_tension, editing } => {
+            // Editing reuses the recorded joints and tangents; only the tensions come from here.
+            let ta = value(app, a_tension, ValueKind::Unitless, "Tension 1")?;
+            let tb = value(app, b_tension, ValueKind::Unitless, "Tension 2")?;
+            if let Some(id) = editing {
+                return Ok(vec![("sketch.blend3d".to_string(), json!({"edit": id, "a_tension": ta, "b_tension": tb}))]);
+            }
             let picked =
                 |i: usize, what: &str| -> Result<Sel, String> { items(inputs, i).first().cloned().ok_or_else(|| format!("Select the {what}")) };
             let point_of = |i: usize, what: &str| -> Result<Value, String> {
@@ -823,8 +855,6 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                     _ => Err(format!("Pick an edge or sketch curve for {what}")),
                 }
             };
-            let ta = value(app, a_tension, ValueKind::Unitless, "Tension 1")?;
-            let tb = value(app, b_tension, ValueKind::Unitless, "Tension 2")?;
             let params = json!({
                 "a_at": point_of(0, "Point or vertex 1")?,
                 "a_tangent": tangent_of(1, "Tangent 1")?,

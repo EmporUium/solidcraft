@@ -2353,7 +2353,18 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, r
     let mut activate: Option<usize> = None;
     let mut remove = None;
     let shell_count = d.shell_faces(s).map(|faces| faces.len());
+    // The blend asks six values in picking order, so its tensions belong beside their tangents
+    // rather than after all four picks. They are read here, written back below the loop.
+    let mut tensions: Option<[String; 2]> = match &d.kind {
+        Kind::SketchModify(crate::sketch_modify_ui::Mod::Blend { a_tension, b_tension, .. }) => Some([a_tension.clone(), b_tension.clone()]),
+        _ => None,
+    };
     for (i, inp) in d.inputs.iter().enumerate().skip(range.start).take(range.end.saturating_sub(range.start)) {
+        if i == 2
+            && let Some([a_tension, _]) = &mut tensions
+        {
+            crate::sketch_modify_ui::number_row(ui, "Tension 1", a_tension);
+        }
         let stored_reference = feature_pattern_reference_key(d, i).and_then(|key| d.extra.get(key)).filter(|_| inp.items.is_empty());
         form_row(ui, inp.label, |ui| {
             ui.horizontal(|ui| {
@@ -2427,6 +2438,15 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, r
                 }
             }
         }
+    }
+    if let Some([_, b_tension]) = &mut tensions {
+        crate::sketch_modify_ui::number_row(ui, "Tension 2", b_tension);
+    }
+    if let Some([a, b]) = tensions
+        && let Kind::SketchModify(crate::sketch_modify_ui::Mod::Blend { a_tension, b_tension, .. }) = &mut d.kind
+    {
+        *a_tension = a;
+        *b_tension = b;
     }
     if let Some((input, index)) = remove
         && let Some(input) = d.inputs.get_mut(input)
